@@ -14,10 +14,15 @@ void freerange(void *pa_start, void *pa_end);
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
 
+
+// we are creating a linked list which has pointers to free pages
+// the *next is a pointer pointing to the next memory page
 struct run {
   struct run *next;
 };
 
+// the frelist contains all the free memory pages, we need to get count 
+//spinlock ensures thread safety
 struct {
   struct spinlock lock;
   struct run *freelist;
@@ -56,10 +61,10 @@ kfree(void *pa)
 
   r = (struct run*)pa;
 
-  acquire(&kmem.lock);
+//  acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
-  release(&kmem.lock);
+//  release(&kmem.lock);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -79,4 +84,26 @@ kalloc(void)
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
+}
+
+// this 
+int
+countpages()
+{
+    int count = 0;
+
+    struct run *r;
+// the free list structure has pointers to the avaliable free memory pages
+    acquire(&kmem.lock);
+    r = kmem.freelist;
+
+    //iterate over linked list until it ends
+    while (r != 0) {
+        count += 1;
+        r = r->next;
+    }
+
+    release(&kmem.lock);
+
+    return count;
 }

@@ -22,6 +22,9 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+int time(void);
+int getmem(void);
+int get_sha256(char*);
 
 // ulib.c
 int stat(const char*, struct stat*);

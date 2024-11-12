@@ -28,7 +28,8 @@ OBJS = \
   $K/sysfile.o \
   $K/kernelvec.o \
   $K/plic.o \
-  $K/virtio_disk.o
+  $K/virtio_disk.o \
+  $K/sha256.o       
 
 # riscv64-unknown-elf- or riscv64-linux-gnu-
 # perhaps in /opt/riscv/bin
@@ -49,6 +50,7 @@ TOOLPREFIX := $(shell if riscv64-unknown-elf-objdump -i 2>&1 | grep 'elf64-big' 
 endif
 
 QEMU = qemu-system-riscv64
+
 
 CC = $(TOOLPREFIX)gcc
 AS = $(TOOLPREFIX)gas
@@ -139,9 +141,19 @@ UPROGS=\
 	$U/_grind\
 	$U/_wc\
 	$U/_zombie\
+	$U/_helloq\
+	$U/_sha_syscall\
+	$U/_clock\
+	$U/_uptime\
+	$U/_testingtime\
+	$U/_getmemory\
+    	$U/_sha256\
+    	
 
-fs.img: mkfs/mkfs README $(UPROGS)
-	mkfs/mkfs fs.img README $(UPROGS)
+   	
+
+fs.img: mkfs/mkfs README sample.txt $(UPROGS)
+	mkfs/mkfs fs.img README sample.txt $(UPROGS)
 
 -include kernel/*.d user/*.d
 

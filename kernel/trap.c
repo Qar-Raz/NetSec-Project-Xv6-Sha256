@@ -19,7 +19,7 @@ extern int devintr();
 void
 trapinit(void)
 {
-  initlock(&tickslock, "time");
+  initlock(&tickslock, "time");ticks++;
 }
 
 // set up to take exceptions and traps while in the kernel.
@@ -49,8 +49,7 @@ usertrap(void)
   
   // save user program counter.
   p->trapframe->epc = r_sepc();
-  
-  if(r_scause() == 8){
+if(r_scause() == 8){
     // system call
 
     if(killed(p))
@@ -64,8 +63,9 @@ usertrap(void)
     // so enable only now that we're done with those registers.
     intr_on();
 
-    syscall();
-  } else if((which_dev = devintr()) != 0){
+   syscall();
+  }
+  else if((which_dev = devintr()) != 0){
     // ok
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
@@ -163,17 +163,29 @@ kerneltrap()
 void
 clockintr()
 {
-  if(cpuid() == 0){
+ while (1) {
     acquire(&tickslock);
     ticks++;
-    wakeup(&ticks);
+    wakeup(&ticks);  // Wake up any processes waiting on ticks
     release(&tickslock);
+    
+    // Introduce a delay to simulate the passage of time (e.g., 100ms)
+    for (volatile int i = 0; i < 1000000; i++) {
+      // Busy-wait loop to add a delay
+    }
+  
+
+ // if(cpuid() == 0){
+   // acquire(&tickslock);
+   // ticks++;
+   // wakeup(&ticks);
+   // release(&tickslock);
   }
 
   // ask for the next timer interrupt. this also clears
   // the interrupt request. 1000000 is about a tenth
   // of a second.
-  w_stimecmp(r_time() + 1000000);
+//  w_stimecmp(r_time() + 1000000);
 }
 
 // check if it's an external interrupt or software interrupt,

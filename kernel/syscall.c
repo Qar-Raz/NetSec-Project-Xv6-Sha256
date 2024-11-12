@@ -78,8 +78,7 @@ argstr(int n, char *buf, int max)
   argaddr(n, &addr);
   return fetchstr(addr, buf, max);
 }
-
-// Prototypes for the functions that handle system calls.
+  // Prototypes for the functions that handle system calls.
 extern uint64 sys_fork(void);
 extern uint64 sys_exit(void);
 extern uint64 sys_wait(void);
@@ -101,9 +100,12 @@ extern uint64 sys_unlink(void);
 extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
-
+extern uint64 sys_time(void);
+extern uint64 sys_getmem(void);
+extern uint64 sys_get_sha256(void);
 // An array mapping syscall numbers from syscall.h
-// to the function that handles the system call.
+
+// to the function that handles the system call
 static uint64 (*syscalls[])(void) = {
 [SYS_fork]    sys_fork,
 [SYS_exit]    sys_exit,
@@ -126,20 +128,31 @@ static uint64 (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
-};
+[SYS_time]    sys_time,
+[SYS_getmem]  sys_getmem,
+[SYS_get_sha256] sys_get_sha256
 
+};
+//@Qamar == very imp function
 void
 syscall(void)
 {
   int num;
   struct proc *p = myproc();
 
+//the syscall number is stored in register a7, this line retrieves it
   num = p->trapframe->a7;
+
+//this condition checks if it is valid, must be greater than 0 and less than 
+// the len of syscall array and that the syscall actually exists
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     // Use num to lookup the system call function for num, call it,
     // and store its return value in p->trapframe->a0
     p->trapframe->a0 = syscalls[num]();
-  } else {
+  }
+
+// else handle the error
+ else {
     printf("%d %s: unknown sys call %d\n",
             p->pid, p->name, num);
     p->trapframe->a0 = -1;
