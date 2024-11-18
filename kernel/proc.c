@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sha256.h"
 
 struct cpu cpus[NCPU];
 
@@ -693,3 +694,32 @@ procdump(void)
     printf("\n");
   }
 }
+
+
+uint64
+kernel_sha256(void) {
+    // Hardcoded input string
+    char input[] = "kernel"; 
+    uint8 hash[32];          // Buffer for the SHA-256 output
+    SHA256_CTX ctx;          // SHA-256 context
+    char hex_output[65];     // Buffer for the hexadecimal hash string
+    int i;
+
+    // SHA-256 computation steps
+    sha256_init(&ctx);                            // Initialize SHA-256 context
+    sha256_update(&ctx, (uint8*)input, strlen(input));  // Process the input string
+    sha256_final(&ctx, hash);                     // Finalize the hash
+
+    // Convert hash to hexadecimal string
+    for (i = 0; i < 32; i++) {
+        byte_to_hex(hash[i], &hex_output[i * 2]);
+    }
+    hex_output[64] = '\0';  // Null-terminate the string
+
+    // Print the hash
+    printf("Input for Kernel Space =  %s\n", input);
+    printf("SHA-256 hash = %s\n", hex_output);
+
+    return 0;
+}
+

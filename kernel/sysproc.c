@@ -140,7 +140,7 @@ sys_get_sha256(void) {
     for (i = 0; i < 32; i++) {
         byte_to_hex(hash[i], &hex_output[i * 2]);
     }
-    hex_output[64] = '\0';
+    hex_output[64] = '\0'; // to terminate the null string
 
     printf("SHA-256 hash: %s\n", hex_output);
 
