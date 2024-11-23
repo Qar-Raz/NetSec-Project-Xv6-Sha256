@@ -15,7 +15,17 @@ int main(int argc, char *argv[]) {
     }
 
     // Call the SHA-256 system call with the user-provided string
-    get_sha256(argv[1]);
+    int start_time = time();
+    
+                      get_sha256(argv[1]);
+                      
+int end_time = time();
+
+int final_time = end_time - start_time;
+
+printf("\nComputed in Ticks =  %d\n", final_time);
+    
+   
 
     exit(0);
 }

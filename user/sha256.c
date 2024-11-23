@@ -1,17 +1,21 @@
-#include "kernel/types.h"
-#include "user/user.h"
-#include "kernel/fcntl.h" 
-#include "kernel/syscall.h"
+#include "kernel/types.h" // Include the kernel types header file for data types --@Qamar
+#include "user/user.h" // Include the user header file --@Qamar
+#include "kernel/fcntl.h" // Include the kernel file control header file --@Qamar
+#include "kernel/syscall.h" // Include the kernel syscall header file to access syscall for file reading --@Qamar
 
-#define ROTLEFT(a, b) ((a << b) | (a >> (32 - b)))
-#define ROTRIGHT(a, b) ((a >> b) | (a << (32 - b)))
-#define CH(x, y, z) ((x & y) ^ (~x & z))
-#define MAJ(x, y, z) ((x & y) ^ (x & z) ^ (y & z))
-#define EP0(x) (ROTRIGHT(x, 2) ^ ROTRIGHT(x, 13) ^ ROTRIGHT(x, 22))
-#define EP1(x) (ROTRIGHT(x, 6) ^ ROTRIGHT(x, 11) ^ (ROTRIGHT(x, 25)))
-#define SIG0(x) (ROTRIGHT(x, 7) ^ ROTRIGHT(x, 18) ^ (x >> 3))
-#define SIG1(x) (ROTRIGHT(x, 17) ^ ROTRIGHT(x, 19) ^ (x >> 10))
+// Macros to perform bitwise left and right rotations --@Qamar
+#define ROTLEFT(a, b) ((a << b) | (a >> (32 - b))) // Rotate left --@Qamar
+#define ROTRIGHT(a, b) ((a >> b) | (a << (32 - b))) // Rotate right --@Qamar
 
+// Macros for SHA-256 specific bitwise operations --@Qamar
+#define CH(x, y, z) ((x & y) ^ (~x & z)) // Choose function --@Qamar
+#define MAJ(x, y, z) ((x & y) ^ (x & z) ^ (y & z)) // Majority function --@Qamar
+#define EP0(x) (ROTRIGHT(x, 2) ^ ROTRIGHT(x, 13) ^ ROTRIGHT(x, 22)) // SHA-256 compression function 0 --@Qamar
+#define EP1(x) (ROTRIGHT(x, 6) ^ ROTRIGHT(x, 11) ^ (ROTRIGHT(x, 25))) // SHA-256 compression function 1 --@Qamar
+#define SIG0(x) (ROTRIGHT(x, 7) ^ ROTRIGHT(x, 18) ^ (x >> 3)) // SHA-256 message schedule function 0 --@Qamar
+#define SIG1(x) (ROTRIGHT(x, 17) ^ ROTRIGHT(x, 19) ^ (x >> 10)) // SHA-256 message schedule function 1 --@Qamar
+
+// SHA-256 constants --@Qamar
 static const uint32 k[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -23,21 +27,25 @@ static const uint32 k[64] = {
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 };
 
+// Structure to hold SHA-256 context --@Qamar
 typedef struct {
-    uint8 data[64];
-    uint32 datalen;
-    uint64 bitlen;
-    uint32 state[8];
+    uint8 data[64]; // Current data block --@Qamar
+    uint32 datalen; // Length of the current data block --@Qamar
+    uint64 bitlen; // Total length of the processed data in bits --@Qamar
+    uint32 state[8]; // Hash state --@Qamar
 } SHA256_CTX;
 
+// Function to perform the SHA-256 transformation --@Qamar
 void sha256_transform(SHA256_CTX *ctx, uint8 data[]) {
-    uint32 a, b, c, d, e, f, g, h, i, j, t1, t2, m[64];
+    uint32 a, b, c, d, e, f, g, h, i, j, t1, t2, m[64]; 
 
+    // Prepare the message schedule from the input data --@Qamar
     for (i = 0, j = 0; i < 16; ++i, j += 4)
         m[i] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | (data[j + 3]);
     for (; i < 64; ++i)
         m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
 
+    // Initialize working variables with the current hash state --@Qamar
     a = ctx->state[0];
     b = ctx->state[1];
     c = ctx->state[2];
@@ -47,6 +55,7 @@ void sha256_transform(SHA256_CTX *ctx, uint8 data[]) {
     g = ctx->state[6];
     h = ctx->state[7];
 
+    // Perform the main hash computation --@Qamar
     for (i = 0; i < 64; ++i) {
         t1 = h + EP1(e) + CH(e, f, g) + k[i] + m[i];
         t2 = EP0(a) + MAJ(a, b, c);
@@ -60,6 +69,7 @@ void sha256_transform(SHA256_CTX *ctx, uint8 data[]) {
         a = t1 + t2;
     }
 
+    // Update the hash state with the results of this chunk --@Qamar
     ctx->state[0] += a;
     ctx->state[1] += b;
     ctx->state[2] += c;
@@ -70,57 +80,63 @@ void sha256_transform(SHA256_CTX *ctx, uint8 data[]) {
     ctx->state[7] += h;
 }
 
+// Function to initialize the SHA-256 context --@Qamar
 void sha256_init(SHA256_CTX *ctx) {
-    ctx->datalen = 0;
-    ctx->bitlen = 0;
-    ctx->state[0] = 0x6a09e667;
-    ctx->state[1] = 0xbb67ae85;
-    ctx->state[2] = 0x3c6ef372;
+    ctx->datalen = 0; // Initialize datalen to 0 --@Qamar
+    ctx->bitlen = 0; // Initialize bitlen to 0 --@Qamar
+    ctx->state[0] = 0x6a09e667; 
+    ctx->state[1] = 0xbb67ae85; 
+    ctx->state[2] = 0x3c6ef372; 
     ctx->state[3] = 0xa54ff53a;
-    ctx->state[4] = 0x510e527f;
-    ctx->state[5] = 0x9b05688c;
-    ctx->state[6] = 0x1f83d9ab;
-    ctx->state[7] = 0x5be0cd19;
+    ctx->state[4] = 0x510e527f; 
+    ctx->state[5] = 0x9b05688c; 
+    ctx->state[6] = 0x1f83d9ab; 
+    ctx->state[7] = 0x5be0cd19; 
 }
 
+// Function to update the SHA-256 context with new data --@Qamar
 void sha256_update(SHA256_CTX *ctx, uint8 data[], uint len) {
     for (uint i = 0; i < len; ++i) {
-        ctx->data[ctx->datalen] = data[i];
-        ctx->datalen++;
-        if (ctx->datalen == 64) {
-            sha256_transform(ctx, ctx->data);
-            ctx->bitlen += 512;
-            ctx->datalen = 0;
+        ctx->data[ctx->datalen] = data[i]; // Copy data to the context --@Qamar
+        ctx->datalen++; // Increment datalen --@Qamar
+        if (ctx->datalen == 64) { // If the data block is full --@Qamar
+            sha256_transform(ctx, ctx->data); // Transform the data --@Qamar
+            ctx->bitlen += 512; // Update bitlen --@Qamar
+            ctx->datalen = 0; // Reset datalen --@Qamar
         }
     }
 }
 
+// Function to finalize the SHA-256 hash and produce the digest --@Qamar
 void sha256_final(SHA256_CTX *ctx, uint8 hash[]) {
-    uint32 i = ctx->datalen;
+    uint32 i = ctx->datalen; // Get the current datalen --@Qamar
 
+    // Pad the remaining data --@Qamar
     if (ctx->datalen < 56) {
-        ctx->data[i++] = 0x80;
-        while (i < 56)
+        ctx->data[i++] = 0x80; // Append a '1' bit --@Qamar
+        while (i < 56) // Append '0' bits --@Qamar
             ctx->data[i++] = 0x00;
     } else {
-        ctx->data[i++] = 0x80;
-        while (i < 64)
+        ctx->data[i++] = 0x80; // Append a '1' bit --@Qamar
+        while (i < 64) // Append '0' bits --@Qamar
             ctx->data[i++] = 0x00;
-        sha256_transform(ctx, ctx->data);
-        memset(ctx->data, 0, 56);
+        sha256_transform(ctx, ctx->data); // Transform the data --@Qamar
+        memset(ctx->data, 0, 56); // Clear the data block --@Qamar
     }
 
-    ctx->bitlen += ctx->datalen * 8;
-    ctx->data[63] = ctx->bitlen;
-    ctx->data[62] = ctx->bitlen >> 8;
-    ctx->data[61] = ctx->bitlen >> 16;
-    ctx->data[60] = ctx->bitlen >> 24;
-    ctx->data[59] = ctx->bitlen >> 32;
-    ctx->data[58] = ctx->bitlen >> 40;
-    ctx->data[57] = ctx->bitlen >> 48;
-    ctx->data[56] = ctx->bitlen >> 56;
-    sha256_transform(ctx, ctx->data);
+    // Append the total length of the data --@Qamar
+    ctx->bitlen += ctx->datalen * 8; // Update bitlen --@Qamar
+    ctx->data[63] = ctx->bitlen; // Append bitlen --@Qamar
+    ctx->data[62] = ctx->bitlen >> 8; 
+    ctx->data[61] = ctx->bitlen >> 16; 
+    ctx->data[60] = ctx->bitlen >> 24; 
+    ctx->data[59] = ctx->bitlen >> 32; 
+    ctx->data[58] = ctx->bitlen >> 40; 
+    ctx->data[57] = ctx->bitlen >> 48; 
+    ctx->data[56] = ctx->bitlen >> 56; 
+    sha256_transform(ctx, ctx->data); // Transform the data --@Qamar
 
+    // Produce the final hash value --@Qamar
     for (i = 0; i < 4; ++i) {
         hash[i] = (ctx->state[0] >> (24 - i * 8)) & 0x000000ff;
         hash[i + 4] = (ctx->state[1] >> (24 - i * 8)) & 0x000000ff;
@@ -133,11 +149,16 @@ void sha256_final(SHA256_CTX *ctx, uint8 hash[]) {
     }
 }
 
+// Function to convert a byte to a hexadecimal string --@Qamar
 void byte_to_hex(uint8 byte, char* hex_str) {
-    const char hex_chars[] = "0123456789abcdef";
-    hex_str[0] = hex_chars[(byte >> 4) & 0x0F];
-    hex_str[1] = hex_chars[byte & 0x0F];
+    const char hex_chars[] = "0123456789abcdef"; // Hexadecimal characters --@Qamar
+    hex_str[0] = hex_chars[(byte >> 4) & 0x0F]; // Convert high nibble to hex --@Qamar
+    hex_str[1] = hex_chars[byte & 0x0F]; // Convert low nibble to hex --@Qamar
 }
+
+
+
+// the main function for the user space implementation --@Qamar
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
@@ -177,11 +198,17 @@ int main(int argc, char *argv[]) {
     
     close(fd);
     
+    
+    int start_time = time();
+    
     // these are the actual hashing functions -- @Qamar
     sha256_init(&ctx);
     sha256_update(&ctx,(uint8*) buffer, strlen(buffer));
     sha256_final(&ctx, hash);
     
+    int end_time = time();
+    
+    int final_time = end_time - start_time;
 
 
 // this for loop is for conveting the bytes to hex. Xv6 does not support hexadecimals so we have to output is as a string --@Qamar
@@ -190,7 +217,9 @@ int main(int argc, char *argv[]) {
     }
     hex_output[64] = '\0'; // Null-terminate the string
 
-    printf("\nSHA-256 hash: %s\n", hex_output);
+    printf("\nSHA-256 hash =  %s\n", hex_output);
+    printf("Computation in Ticks =  %d\n", final_time);
+
 
     return 0;
 }

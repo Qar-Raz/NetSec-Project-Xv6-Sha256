@@ -5,6 +5,7 @@
 #include "defs.h"
 #include "sha256.h"
 
+
 volatile static int started = 0;
 
 // start() jumps here in supervisor mode on all CPUs.
@@ -37,12 +38,15 @@ main()
     SHA256_CTX ctx;          // SHA-256 context
     char hex_output[65];     // Buffer for the hexadecimal hash string
     int i;
-
+    
+int start_time = r_time();
     // SHA-256 computation steps
     sha256_init(&ctx);                            // Initialize SHA-256 context
     sha256_update(&ctx, (uint8*)input, strlen(input));  // Process the input string
     sha256_final(&ctx, hash);                     // Finalize the hash
+int end_time = r_time();
 
+int final_time = end_time - start_time;
     // Convert hash to hexadecimal string
     for (i = 0; i < 32; i++) {
         byte_to_hex(hash[i], &hex_output[i * 2]);
@@ -56,6 +60,8 @@ main()
     
     printf("Input for Kernel Space =  %s\n", input);
     printf("SHA-256 hash = %s\n", hex_output);
+    printf("\nComputed in Ticks =  %d\n", final_time);
+
 //------------------------------------------------SHA256 FOR KERNEL SPACE CODE
 
 // could make this code into a function in proc.c for cleaner implementation --@Qamar
