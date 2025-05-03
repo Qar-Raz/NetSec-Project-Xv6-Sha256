@@ -16,4 +16,6 @@ void sha256_update(SHA256_CTX *ctx, uint8 data[], uint len);
 void sha256_final(SHA256_CTX *ctx, uint8 hash[]);
 void byte_to_hex(uint8 byte, char* hex_str);
 
+int retrieve_boot_hash(char *output_buffer, int buffer_size);
+void store_boot_hash(char *calculated_hash_hex);
 #endif

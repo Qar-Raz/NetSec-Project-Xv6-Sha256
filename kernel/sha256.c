@@ -1,10 +1,14 @@
 #include "kernel/types.h"
-#include "user/user.h"
 #include "kernel/syscall.h"
+#include "kernel/string.h"
+
 
 // adding sha256.h here gives conflicting types error
 
 
+// variables to store current hash
+static char boot_hash_hex_storage[65];
+static int boot_hash_is_ready = 0;
 
 #define ROTLEFT(a, b) ((a << b) | (a >> (32 - b)))
 #define ROTRIGHT(a, b) ((a >> b) | (a << (32 - b)))
@@ -140,4 +144,41 @@ void byte_to_hex(uint8 byte, char* hex_str) {
     const char hex_chars[] = "0123456789abcdef";
     hex_str[0] = hex_chars[(byte >> 4) & 0x0F];
     hex_str[1] = hex_chars[byte & 0x0F];
+}
+
+
+
+void store_boot_hash(char *calculated_hash_hex) {
+    if (calculated_hash_hex != 0) {
+        // Use strncpy: Copies up to n characters. Does NOT guarantee null term
+        // if src is n chars or longer.
+        strncpy(boot_hash_hex_storage, calculated_hash_hex, sizeof(boot_hash_hex_storage) - 1); // Copy max 64 chars
+
+        // ** CRITICAL: Manually null-terminate the buffer **
+        // This ensures the string is terminated even if strncpy didn't add one.
+        boot_hash_hex_storage[sizeof(boot_hash_hex_storage) - 1] = '\0';
+
+        boot_hash_is_ready = 1; // Mark as ready
+    }
+}
+
+// --- Public function for the system call to retrieve the hash ---
+// Returns 0 on success, -1 if hash isn't ready or buffer too small.
+int retrieve_boot_hash(char *output_buffer, int buffer_size) {
+    if (!boot_hash_is_ready || output_buffer == 0) {
+        return -1; // Hash not ready or output buffer invalid
+    }
+    // Ensure the provided buffer is large enough for the hash string + null
+    // We need space for 64 hex chars + 1 null = 65 bytes.
+    if (buffer_size < sizeof(boot_hash_hex_storage)) {
+        return -1; // Buffer too small
+    }
+
+    // Use strncpy: Copies up to n characters. Does NOT guarantee null term.
+    strncpy(output_buffer, boot_hash_hex_storage, buffer_size - 1); // Copy max buffer_size-1 chars
+
+    // ** CRITICAL: Manually null-terminate the output buffer **
+    output_buffer[buffer_size - 1] = '\0';
+
+    return 0; // Success
 }

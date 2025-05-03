@@ -1,4 +1,4 @@
-// Sleeping locks
+// Sleeping locks mr miyagi 
 
 #include "types.h"
 #include "riscv.h"
@@ -50,6 +50,3 @@ holdingsleep(struct sleeplock *lk)
   release(&lk->lk);
   return r;
 }
-
-
-

@@ -1,0 +1,693 @@
+// Buffer cache.
+//
+// The buffer cache is a linked list of buf structures holding
+// cached copies of disk block contents.  Caching disk blocks
+// in memory reduces the number of disk reads and also provides
+// a synchronization point for disk blocks used by multiple processes.
+//
+// Interface:
+// * To get a buffer for a particular disk block, call bread.
+// * After changing buffer data, call bwrite to write it to disk.
+// * When done with the buffer, call brelse.
+// * Do not use the buffer after calling brelse.
+// * Only one process at a time can use a buffer,
+//     so do not keep them longer than necessary.
+
+
+#include "types.h"
+#include "param.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "riscv.h"
+#include "defs.h"
+#include "fs.h"
+#include "buf.h"
+
+struct {
+  struct spinlock lock;
+  struct buf buf[NBUF];
+
+  // Linked list of all buffers, through prev/next.
+  // Sorted by how recently the buffer was used.
+  // head.next is most recent, head.prev is least.
+  struct buf head;
+} bcache;
+
+void
+binit(void)
+{
+  struct buf *b;
+
+  initlock(&bcache.lock, "bcache");
+
+  // Create linked list of buffers
+  bcache.head.prev = &bcache.head;
+  bcache.head.next = &bcache.head;
+  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
+    b->next = bcache.head.next;
+    b->prev = &bcache.head;
+    initsleeplock(&b->lock, "buffer");
+    bcache.head.next->prev = b;
+    bcache.head.next = b;
+  }
+}
+
+// Look through buffer cache for block on device dev.
+// If not found, allocate a buffer.
+// In either case, return locked buffer.
+static struct buf*
+bget(uint dev, uint blockno)
+{
+  struct buf *b;
+
+  acquire(&bcache.lock);
+
+  // Is the block already cached?
+  for(b = bcache.head.next; b != &bcache.head; b = b->next){
+    if(b->dev == dev && b->blockno == blockno){
+      b->refcnt++;
+      release(&bcache.lock);
+      acquiresleep(&b->lock);
+      return b;
+    }
+  }
+
+  // Not cached.
+  // Recycle the least recently used (LRU) unused buffer.
+  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
+    if(b->refcnt == 0) {
+      b->dev = dev;
+      b->blockno = blockno;
+      b->valid = 0;
+      b->refcnt = 1;
+      release(&bcache.lock);
+      acquiresleep(&b->lock);
+      return b;
+    }
+  }
+  panic("bget: no buffers");
+}
+
+// Return a locked buf with the contents of the indicated block.
+struct buf*
+bread(uint dev, uint blockno)
+{
+  struct buf *b;
+
+  b = bget(dev, blockno);
+  if(!b->valid) {
+    virtio_disk_rw(b, 0);
+    b->valid = 1;
+  }
+  return b;
+}
+
+// Write b's contents to disk.  Must be locked.
+void
+bwrite(struct buf *b)
+{
+  if(!holdingsleep(&b->lock))
+    panic("bwrite");
+  virtio_disk_rw(b, 1);
+}
+
+// Release a locked buffer.
+// Move to the head of the most-recently-used list.
+void
+brelse(struct buf *b)
+{
+  if(!holdingsleep(&b->lock))
+    panic("brelse");
+
+  releasesleep(&b->lock);
+
+  acquire(&bcache.lock);
+  b->refcnt--;
+  if (b->refcnt == 0) {
+    // no one is waiting for it.
+    b->next->prev = b->prev;
+    b->prev->next = b->next;
+    b->next = bcache.head.next;
+    b->prev = &bcache.head;
+    bcache.head.next->prev = b;
+    bcache.head.next = b;
+  }
+  
+  release(&bcache.lock);
+}
+
+void
+bpin(struct buf *b) {
+  acquire(&bcache.lock);
+  b->refcnt++;
+  release(&bcache.lock);
+}
+
+void
+bunpin(struct buf *b) {
+  acquire(&bcache.lock);
+  b->refcnt--;
+  release(&bcache.lock);
+}
+
+
+//
+// Console input and output, to the uart.
+// Reads are line at a time.
+// Implements special input characters:
+//   newline -- end of line
+//   control-h -- backspace
+//   control-u -- kill line
+//   control-d -- end of file
+//   control-p -- print process list
+//
+
+#include <stdarg.h>
+
+#include "types.h"
+#include "param.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "defs.h"
+#include "proc.h"
+
+#define BACKSPACE 0x100
+#define C(x)  ((x)-'@')  // Control-x
+
+//
+// send one character to the uart.
+// called by printf(), and to echo input characters,
+// but not from write().
+//
+void
+consputc(int c)
+{
+  if(c == BACKSPACE){
+    // if the user typed backspace, overwrite with a space.
+    uartputc_sync('\b'); uartputc_sync(' '); uartputc_sync('\b');
+  } else {
+    uartputc_sync(c);
+  }
+}
+
+struct {
+  struct spinlock lock;
+  
+  // input
+#define INPUT_BUF_SIZE 128
+  char buf[INPUT_BUF_SIZE];
+  uint r;  // Read index
+  uint w;  // Write index
+  uint e;  // Edit index
+} cons;
+
+//
+// user write()s to the console go here.
+//
+int
+consolewrite(int user_src, uint64 src, int n)
+{
+  int i;
+
+  for(i = 0; i < n; i++){
+    char c;
+    if(either_copyin(&c, user_src, src+i, 1) == -1)
+      break;
+    uartputc(c);
+  }
+
+  return i;
+}
+
+//
+// user read()s from the console go here.
+// copy (up to) a whole input line to dst.
+// user_dist indicates whether dst is a user
+// or kernel address.
+//
+int
+consoleread(int user_dst, uint64 dst, int n)
+{
+  uint target;
+  int c;
+  char cbuf;
+
+  target = n;
+  acquire(&cons.lock);
+  while(n > 0){
+    // wait until interrupt handler has put some
+    // input into cons.buffer.
+    while(cons.r == cons.w){
+      if(killed(myproc())){
+        release(&cons.lock);
+        return -1;
+      }
+      sleep(&cons.r, &cons.lock);
+    }
+
+    c = cons.buf[cons.r++ % INPUT_BUF_SIZE];
+
+    if(c == C('D')){  // end-of-file
+      if(n < target){
+        // Save ^D for next time, to make sure
+        // caller gets a 0-byte result.
+        cons.r--;
+      }
+      break;
+    }
+
+    // copy the input byte to the user-space buffer.
+    cbuf = c;
+    if(either_copyout(user_dst, dst, &cbuf, 1) == -1)
+      break;
+
+    dst++;
+    --n;
+
+    if(c == '\n'){
+      // a whole line has arrived, return to
+      // the user-level read().
+      break;
+    }
+  }
+  release(&cons.lock);
+
+  return target - n;
+}
+
+//
+// the console input interrupt handler.
+// uartintr() calls this for input character.
+// do erase/kill processing, append to cons.buf,
+// wake up consoleread() if a whole line has arrived.
+//
+void
+consoleintr(int c)
+{
+  acquire(&cons.lock);
+
+  switch(c){
+  case C('P'):  // Print process list.
+    procdump();
+    break;
+  case C('U'):  // Kill line.
+    while(cons.e != cons.w &&
+          cons.buf[(cons.e-1) % INPUT_BUF_SIZE] != '\n'){
+      cons.e--;
+      consputc(BACKSPACE);
+    }
+    break;
+  case C('H'): // Backspace
+  case '\x7f': // Delete key
+    if(cons.e != cons.w){
+      cons.e--;
+      consputc(BACKSPACE);
+    }
+    break;
+  default:
+    if(c != 0 && cons.e-cons.r < INPUT_BUF_SIZE){
+      c = (c == '\r') ? '\n' : c;
+
+      // echo back to the user.
+      consputc(c);
+
+      // store for consumption by consoleread().
+      cons.buf[cons.e++ % INPUT_BUF_SIZE] = c;
+
+      if(c == '\n' || c == C('D') || cons.e-cons.r == INPUT_BUF_SIZE){
+        // wake up consoleread() if a whole line (or end-of-file)
+        // has arrived.
+        cons.w = cons.e;
+        wakeup(&cons.r);
+      }
+    }
+    break;
+  }
+  
+  release(&cons.lock);
+}
+
+void
+consoleinit(void)
+{
+  initlock(&cons.lock, "cons");
+
+  uartinit();
+
+  // connect read and write system calls
+  // to consoleread and consolewrite.
+  devsw[CONSOLE].read = consoleread;
+  devsw[CONSOLE].write = consolewrite;
+}
+//
+// Support functions for system calls that involve file descriptors.
+//
+
+#include "types.h"
+#include "riscv.h"
+#include "defs.h"
+#include "param.h"
+#include "fs.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "stat.h"
+#include "proc.h"
+
+struct devsw devsw[NDEV];
+struct {
+  struct spinlock lock;
+  struct file file[NFILE];
+} ftable;
+
+void
+fileinit(void)
+{
+  initlock(&ftable.lock, "ftable");
+}
+
+// Allocate a file structure.
+struct file*
+filealloc(void)
+{
+  struct file *f;
+
+  acquire(&ftable.lock);
+  for(f = ftable.file; f < ftable.file + NFILE; f++){
+    if(f->ref == 0){
+      f->ref = 1;
+      release(&ftable.lock);
+      return f;
+    }
+  }
+  release(&ftable.lock);
+  return 0;
+}
+
+// Increment ref count for file f.
+struct file*
+filedup(struct file *f)
+{
+  acquire(&ftable.lock);
+  if(f->ref < 1)
+    panic("filedup");
+  f->ref++;
+  release(&ftable.lock);
+  return f;
+}
+
+// Close file f.  (Decrement ref count, close when reaches 0.)
+void
+fileclose(struct file *f)
+{
+  struct file ff;
+
+  acquire(&ftable.lock);
+  if(f->ref < 1)
+    panic("fileclose");
+  if(--f->ref > 0){
+    release(&ftable.lock);
+    return;
+  }
+  ff = *f;
+  f->ref = 0;
+  f->type = FD_NONE;
+  release(&ftable.lock);
+
+  if(ff.type == FD_PIPE){
+    pipeclose(ff.pipe, ff.writable);
+  } else if(ff.type == FD_INODE || ff.type == FD_DEVICE){
+    begin_op();
+    iput(ff.ip);
+    end_op();
+  }
+}
+
+// Get metadata about file f.
+// addr is a user virtual address, pointing to a struct stat.
+int
+filestat(struct file *f, uint64 addr)
+{
+  struct proc *p = myproc();
+  struct stat st;
+  
+  if(f->type == FD_INODE || f->type == FD_DEVICE){
+    ilock(f->ip);
+    stati(f->ip, &st);
+    iunlock(f->ip);
+    if(copyout(p->pagetable, addr, (char *)&st, sizeof(st)) < 0)
+      return -1;
+    return 0;
+  }
+  return -1;
+}
+
+// Read from file f.
+// addr is a user virtual address.
+int
+fileread(struct file *f, uint64 addr, int n)
+{
+  int r = 0;
+
+  if(f->readable == 0)
+    return -1;
+
+  if(f->type == FD_PIPE){
+    r = piperead(f->pipe, addr, n);
+  } else if(f->type == FD_DEVICE){
+    if(f->major < 0 || f->major >= NDEV || !devsw[f->major].read)
+      return -1;
+    r = devsw[f->major].read(1, addr, n);
+  } else if(f->type == FD_INODE){
+    ilock(f->ip);
+    if((r = readi(f->ip, 1, addr, f->off, n)) > 0)
+      f->off += r;
+    iunlock(f->ip);
+  } else {
+    panic("fileread");
+  }
+
+  return r;
+}
+
+// Write to file f.
+// addr is a user virtual address.
+int
+filewrite(struct file *f, uint64 addr, int n)
+{
+  int r, ret = 0;
+
+  if(f->writable == 0)
+    return -1;
+
+  if(f->type == FD_PIPE){
+    ret = pipewrite(f->pipe, addr, n);
+  } else if(f->type == FD_DEVICE){
+    if(f->major < 0 || f->major >= NDEV || !devsw[f->major].write)
+      return -1;
+    ret = devsw[f->major].write(1, addr, n);
+  } else if(f->type == FD_INODE){
+    // write a few blocks at a time to avoid exceeding
+    // the maximum log transaction size, including
+    // i-node, indirect block, allocation blocks,
+    // and 2 blocks of slop for non-aligned writes.
+    // this really belongs lower down, since writei()
+    // might be writing a device like the console.
+    int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
+    int i = 0;
+    while(i < n){
+      int n1 = n - i;
+      if(n1 > max)
+        n1 = max;
+
+      begin_op();
+      ilock(f->ip);
+      if ((r = writei(f->ip, 1, addr + i, f->off, n1)) > 0)
+        f->off += r;
+      iunlock(f->ip);
+      end_op();
+
+      if(r != n1){
+        // error from writei
+        break;
+      }
+      i += r;
+    }
+    ret = (i == n ? n : -1);
+  } else {
+    panic("filewrite");
+  }
+
+  return ret;
+}
+
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "defs.h"
+#include "elf.h"
+
+static int loadseg(pde_t *, uint64, struct inode *, uint, uint);
+
+int flags2perm(int flags)
+{
+    int perm = 0;
+    if(flags & 0x1)
+      perm = PTE_X;
+    if(flags & 0x2)
+      perm |= PTE_W;
+    return perm;
+}
+
+int
+exec(char *path, char **argv)
+{
+  char *s, *last;
+  int i, off;
+  uint64 argc, sz = 0, sp, ustack[MAXARG], stackbase;
+  struct elfhdr elf;
+  struct inode *ip;
+  struct proghdr ph;
+  pagetable_t pagetable = 0, oldpagetable;
+  struct proc *p = myproc();
+
+  begin_op();
+
+  if((ip = namei(path)) == 0){
+    end_op();
+    return -1;
+  }
+  ilock(ip);
+
+  // Check ELF header
+  if(readi(ip, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf))
+    goto bad;
+
+  if(elf.magic != ELF_MAGIC)
+    goto bad;
+
+  if((pagetable = proc_pagetable(p)) == 0)
+    goto bad;
+
+  // Load program into memory.
+  for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
+    if(readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
+      goto bad;
+    if(ph.type != ELF_PROG_LOAD)
+      continue;
+    if(ph.memsz < ph.filesz)
+      goto bad;
+    if(ph.vaddr + ph.memsz < ph.vaddr)
+      goto bad;
+    if(ph.vaddr % PGSIZE != 0)
+      goto bad;
+    uint64 sz1;
+    if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz, flags2perm(ph.flags))) == 0)
+      goto bad;
+    sz = sz1;
+    if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
+      goto bad;
+  }
+  iunlockput(ip);
+  end_op();
+  ip = 0;
+
+  p = myproc();
+  uint64 oldsz = p->sz;
+
+  // Allocate some pages at the next page boundary.
+  // Make the first inaccessible as a stack guard.
+  // Use the rest as the user stack.
+  sz = PGROUNDUP(sz);
+  uint64 sz1;
+  if((sz1 = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
+    goto bad;
+  sz = sz1;
+  uvmclear(pagetable, sz-(USERSTACK+1)*PGSIZE);
+  sp = sz;
+  stackbase = sp - USERSTACK*PGSIZE;
+
+  // Push argument strings, prepare rest of stack in ustack.
+  for(argc = 0; argv[argc]; argc++) {
+    if(argc >= MAXARG)
+      goto bad;
+    sp -= strlen(argv[argc]) + 1;
+    sp -= sp % 16; // riscv sp must be 16-byte aligned
+    if(sp < stackbase)
+      goto bad;
+    if(copyout(pagetable, sp, argv[argc], strlen(argv[argc]) + 1) < 0)
+      goto bad;
+    ustack[argc] = sp;
+  }
+  ustack[argc] = 0;
+
+  // push the array of argv[] pointers.
+  sp -= (argc+1) * sizeof(uint64);
+  sp -= sp % 16;
+  if(sp < stackbase)
+    goto bad;
+  if(copyout(pagetable, sp, (char *)ustack, (argc+1)*sizeof(uint64)) < 0)
+    goto bad;
+
+  // arguments to user main(argc, argv)
+  // argc is returned via the system call return
+  // value, which goes in a0.
+  p->trapframe->a1 = sp;
+
+  // Save program name for debugging.
+  for(last=s=path; *s; s++)
+    if(*s == '/')
+      last = s+1;
+  safestrcpy(p->name, last, sizeof(p->name));
+    
+  // Commit to the user image.
+  oldpagetable = p->pagetable;
+  p->pagetable = pagetable;
+  p->sz = sz;
+  p->trapframe->epc = elf.entry;  // initial program counter = main
+  p->trapframe->sp = sp; // initial stack pointer
+  proc_freepagetable(oldpagetable, oldsz);
+
+  return argc; // this ends up in a0, the first argument to main(argc, argv)
+
+ bad:
+  if(pagetable)
+    proc_freepagetable(pagetable, sz);
+  if(ip){
+    iunlockput(ip);
+    end_op();
+  }
+  return -1;
+}
+
+// Load a program segment into pagetable at virtual address va.
+// va must be page-aligned
+// and the pages from va to va+sz must already be mapped.
+// Returns 0 on success, -1 on failure.
+static int
+loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset, uint sz)
+{
+  uint i, n;
+  uint64 pa;
+
+  for(i = 0; i < sz; i += PGSIZE){
+    pa = walkaddr(pagetable, va + i);
+    if(pa == 0)
+      panic("loadseg: address should exist");
+    if(sz - i < PGSIZE)
+      n = sz - i;
+    else
+      n = PGSIZE;
+    if(readi(ip, 0, (uint64)pa, offset+i, n) != n)
+      return -1;
+  }
+  
+  return 0;
+}

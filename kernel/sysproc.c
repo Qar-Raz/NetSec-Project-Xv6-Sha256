@@ -106,17 +106,30 @@ uint64 current_time = r_time();  // Call r_time to get the current timer value
 
 
 }
+// In sysproc.c
 uint64
 sys_getmem(void) {
-    int page_count;
-    page_count = countpages(); // countpages() returns the number of free pages
-				// it is defined in kernel/kalloc.c
-				// it is also placed in kernel/defs.h so that it can be accessed 
-                                //here or any place with kernel/defs.h header
-    int megabytes;
-    megabytes = (page_count * 4096) / (1024 * 1024); // Convert bytes to MB
-    return megabytes;
+  char kernel_temp_buffer[65];
+
+  // Get the boot hash
+  if (retrieve_boot_hash(kernel_temp_buffer, sizeof(kernel_temp_buffer)) < 0) {
+    printf("sys_getmem: Hash not ready.\n");
+    return -1;
+  }
+
+  // Fixed location in user process to copy to (user buffer must exist!)
+  // Or better: use trapframe->a0 (holds the pointer passed by user code)
+  uint64 user_dst = myproc()->trapframe->a0;
+
+  // Copy to user space
+  if (copyout(myproc()->pagetable, user_dst, kernel_temp_buffer, sizeof(kernel_temp_buffer)) < 0) {
+    printf("sys_getmem: copyout failed.\n");
+    return -1;
+  }
+
+  return 0;
 }
+
 
 uint64
 sys_get_sha256(void) {
