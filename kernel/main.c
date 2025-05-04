@@ -27,6 +27,8 @@ main()
     printfinit();
     printf("\n");
     printf("xv6 kernel is booting\n");
+    printf("\n");
+    printf("\n");
     kinit();         // physical page allocator
     kvminit();       // create kernel page table
     kvminithart();   // turn on paging
@@ -48,7 +50,7 @@ main()
     int i;
 
     // Use the embedded data declared above
-    printf("Hashing embedded content of kernel/sleeplock.c (%d bytes)\n",  kernel_subset_sources_tmp_len);
+    printf("Length of all kernel files =%d\n ",  kernel_subset_sources_tmp_len);
 
     int start_time = r_time(); // Assuming r_time() is your function to get time ticks
     // SHA-256 computation steps
@@ -73,7 +75,7 @@ main()
 
     store_boot_hash(hex_output);
     // Print the hash
-    printf("SHA-256 hash in kernel: %s\n", hex_output);
+    printf("SHA-256 of all kernel files: %s\n", hex_output);
     printf("Computed in Ticks = %d\n", final_time);
 //------------------------------------------------SHA256 FOR EMBEDDED KERNEL FILE CONTENT
 
@@ -88,6 +90,8 @@ main()
     // these print statements are added to provide instructions and for cleanness --@Qamar
     printf("-------Use sha256 sample.txt for user space implementation\n");
     printf("-------Use sha_syscall {string to be hashed} for system call implementation\n");
+    printf("-------Use to validate =  cat kernel/bio.c kernel/console.c kernel/exec.c kernel/file.c kernel/fs.c kernel/kalloc.c kernel/log.c kernel/main.c kernel/pipe.c kernel/plic.c kernel/printf.c kernel/proc.c kernel/sha256.c kernel/sleeplock.c kernel/spinlock.c kernel/start.c kernel/string.c kernel/syscall.c kernel/sysfile.c kernel/sysproc.c kernel/trap.c kernel/uart.c kernel/virtio_disk.c kernel/vm.c | sha256sum\n");
+    
 
     printf("\n");
     printf("\n");

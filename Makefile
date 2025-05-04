@@ -8,9 +8,28 @@ U=user
 KERNEL_SUBSET_SOURCES := \
   $(K)/bio.c \
   $(K)/console.c \
-  $(K)/file.c \
   $(K)/exec.c \
-  # Add any other specific files you want IN THIS SUBSET here.
+  $(K)/file.c \
+  $(K)/fs.c \
+  $(K)/kalloc.c \
+  $(K)/log.c \
+  $(K)/main.c \
+  $(K)/pipe.c \
+  $(K)/plic.c \
+  $(K)/printf.c \
+  $(K)/proc.c \
+  $(K)/sha256.c \
+  $(K)/sleeplock.c \
+  $(K)/spinlock.c \
+  $(K)/start.c \
+  $(K)/string.c \
+  $(K)/syscall.c \
+  $(K)/sysfile.c \
+  $(K)/sysproc.c \
+  $(K)/trap.c \
+  $(K)/uart.c \
+  $(K)/virtio_disk.c \
+  $(K)/vm.c
 
 # Name for the temporary concatenated file (contains the subset)
 KERNEL_ALL_TMP = $(K)/subset_sources.tmp # Renamed temp file for clarity

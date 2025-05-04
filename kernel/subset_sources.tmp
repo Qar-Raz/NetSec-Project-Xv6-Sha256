@@ -343,6 +343,172 @@ consoleinit(void)
   devsw[CONSOLE].read = consoleread;
   devsw[CONSOLE].write = consolewrite;
 }
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "defs.h"
+#include "elf.h"
+
+static int loadseg(pde_t *, uint64, struct inode *, uint, uint);
+
+int flags2perm(int flags)
+{
+    int perm = 0;
+    if(flags & 0x1)
+      perm = PTE_X;
+    if(flags & 0x2)
+      perm |= PTE_W;
+    return perm;
+}
+
+int
+exec(char *path, char **argv)
+{
+  char *s, *last;
+  int i, off;
+  uint64 argc, sz = 0, sp, ustack[MAXARG], stackbase;
+  struct elfhdr elf;
+  struct inode *ip;
+  struct proghdr ph;
+  pagetable_t pagetable = 0, oldpagetable;
+  struct proc *p = myproc();
+
+  begin_op();
+
+  if((ip = namei(path)) == 0){
+    end_op();
+    return -1;
+  }
+  ilock(ip);
+
+  // Check ELF header
+  if(readi(ip, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf))
+    goto bad;
+
+  if(elf.magic != ELF_MAGIC)
+    goto bad;
+
+  if((pagetable = proc_pagetable(p)) == 0)
+    goto bad;
+
+  // Load program into memory.
+  for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
+    if(readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
+      goto bad;
+    if(ph.type != ELF_PROG_LOAD)
+      continue;
+    if(ph.memsz < ph.filesz)
+      goto bad;
+    if(ph.vaddr + ph.memsz < ph.vaddr)
+      goto bad;
+    if(ph.vaddr % PGSIZE != 0)
+      goto bad;
+    uint64 sz1;
+    if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz, flags2perm(ph.flags))) == 0)
+      goto bad;
+    sz = sz1;
+    if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
+      goto bad;
+  }
+  iunlockput(ip);
+  end_op();
+  ip = 0;
+
+  p = myproc();
+  uint64 oldsz = p->sz;
+
+  // Allocate some pages at the next page boundary.
+  // Make the first inaccessible as a stack guard.
+  // Use the rest as the user stack.
+  sz = PGROUNDUP(sz);
+  uint64 sz1;
+  if((sz1 = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
+    goto bad;
+  sz = sz1;
+  uvmclear(pagetable, sz-(USERSTACK+1)*PGSIZE);
+  sp = sz;
+  stackbase = sp - USERSTACK*PGSIZE;
+
+  // Push argument strings, prepare rest of stack in ustack.
+  for(argc = 0; argv[argc]; argc++) {
+    if(argc >= MAXARG)
+      goto bad;
+    sp -= strlen(argv[argc]) + 1;
+    sp -= sp % 16; // riscv sp must be 16-byte aligned
+    if(sp < stackbase)
+      goto bad;
+    if(copyout(pagetable, sp, argv[argc], strlen(argv[argc]) + 1) < 0)
+      goto bad;
+    ustack[argc] = sp;
+  }
+  ustack[argc] = 0;
+
+  // push the array of argv[] pointers.
+  sp -= (argc+1) * sizeof(uint64);
+  sp -= sp % 16;
+  if(sp < stackbase)
+    goto bad;
+  if(copyout(pagetable, sp, (char *)ustack, (argc+1)*sizeof(uint64)) < 0)
+    goto bad;
+
+  // arguments to user main(argc, argv)
+  // argc is returned via the system call return
+  // value, which goes in a0.
+  p->trapframe->a1 = sp;
+
+  // Save program name for debugging.
+  for(last=s=path; *s; s++)
+    if(*s == '/')
+      last = s+1;
+  safestrcpy(p->name, last, sizeof(p->name));
+    
+  // Commit to the user image.
+  oldpagetable = p->pagetable;
+  p->pagetable = pagetable;
+  p->sz = sz;
+  p->trapframe->epc = elf.entry;  // initial program counter = main
+  p->trapframe->sp = sp; // initial stack pointer
+  proc_freepagetable(oldpagetable, oldsz);
+
+  return argc; // this ends up in a0, the first argument to main(argc, argv)
+
+ bad:
+  if(pagetable)
+    proc_freepagetable(pagetable, sz);
+  if(ip){
+    iunlockput(ip);
+    end_op();
+  }
+  return -1;
+}
+
+// Load a program segment into pagetable at virtual address va.
+// va must be page-aligned
+// and the pages from va to va+sz must already be mapped.
+// Returns 0 on success, -1 on failure.
+static int
+loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset, uint sz)
+{
+  uint i, n;
+  uint64 pa;
+
+  for(i = 0; i < sz; i += PGSIZE){
+    pa = walkaddr(pagetable, va + i);
+    if(pa == 0)
+      panic("loadseg: address should exist");
+    if(sz - i < PGSIZE)
+      n = sz - i;
+    else
+      n = PGSIZE;
+    if(readi(ip, 0, (uint64)pa, offset+i, n) != n)
+      return -1;
+  }
+  
+  return 0;
+}
 //
 // Support functions for system calls that involve file descriptors.
 //
@@ -525,6 +691,1539 @@ filewrite(struct file *f, uint64 addr, int n)
   return ret;
 }
 
+// File system implementation.  Five layers:
+//   + Blocks: allocator for raw disk blocks.
+//   + Log: crash recovery for multi-step updates.
+//   + Files: inode allocator, reading, writing, metadata.
+//   + Directories: inode with special contents (list of other inodes!)
+//   + Names: paths like /usr/rtm/xv6/fs.c for convenient naming.
+//
+// This file contains the low-level file system manipulation
+// routines.  The (higher-level) system call implementations
+// are in sysfile.c.
+
+#include "types.h"
+#include "riscv.h"
+#include "defs.h"
+#include "param.h"
+#include "stat.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "buf.h"
+#include "file.h"
+
+#define min(a, b) ((a) < (b) ? (a) : (b))
+// there should be one superblock per disk device, but we run with
+// only one device
+struct superblock sb; 
+
+// Read the super block.
+static void
+readsb(int dev, struct superblock *sb)
+{
+  struct buf *bp;
+
+  bp = bread(dev, 1);
+  memmove(sb, bp->data, sizeof(*sb));
+  brelse(bp);
+}
+
+// Init fs
+void
+fsinit(int dev) {
+  readsb(dev, &sb);
+  if(sb.magic != FSMAGIC)
+    panic("invalid file system");
+  initlog(dev, &sb);
+}
+
+// Zero a block.
+static void
+bzero(int dev, int bno)
+{
+  struct buf *bp;
+
+  bp = bread(dev, bno);
+  memset(bp->data, 0, BSIZE);
+  log_write(bp);
+  brelse(bp);
+}
+
+// Blocks.
+
+// Allocate a zeroed disk block.
+// returns 0 if out of disk space.
+static uint
+balloc(uint dev)
+{
+  int b, bi, m;
+  struct buf *bp;
+
+  bp = 0;
+  for(b = 0; b < sb.size; b += BPB){
+    bp = bread(dev, BBLOCK(b, sb));
+    for(bi = 0; bi < BPB && b + bi < sb.size; bi++){
+      m = 1 << (bi % 8);
+      if((bp->data[bi/8] & m) == 0){  // Is block free?
+        bp->data[bi/8] |= m;  // Mark block in use.
+        log_write(bp);
+        brelse(bp);
+        bzero(dev, b + bi);
+        return b + bi;
+      }
+    }
+    brelse(bp);
+  }
+  printf("balloc: out of blocks\n");
+  return 0;
+}
+
+// Free a disk block.
+static void
+bfree(int dev, uint b)
+{
+  struct buf *bp;
+  int bi, m;
+
+  bp = bread(dev, BBLOCK(b, sb));
+  bi = b % BPB;
+  m = 1 << (bi % 8);
+  if((bp->data[bi/8] & m) == 0)
+    panic("freeing free block");
+  bp->data[bi/8] &= ~m;
+  log_write(bp);
+  brelse(bp);
+}
+
+// Inodes.
+//
+// An inode describes a single unnamed file.
+// The inode disk structure holds metadata: the file's type,
+// its size, the number of links referring to it, and the
+// list of blocks holding the file's content.
+//
+// The inodes are laid out sequentially on disk at block
+// sb.inodestart. Each inode has a number, indicating its
+// position on the disk.
+//
+// The kernel keeps a table of in-use inodes in memory
+// to provide a place for synchronizing access
+// to inodes used by multiple processes. The in-memory
+// inodes include book-keeping information that is
+// not stored on disk: ip->ref and ip->valid.
+//
+// An inode and its in-memory representation go through a
+// sequence of states before they can be used by the
+// rest of the file system code.
+//
+// * Allocation: an inode is allocated if its type (on disk)
+//   is non-zero. ialloc() allocates, and iput() frees if
+//   the reference and link counts have fallen to zero.
+//
+// * Referencing in table: an entry in the inode table
+//   is free if ip->ref is zero. Otherwise ip->ref tracks
+//   the number of in-memory pointers to the entry (open
+//   files and current directories). iget() finds or
+//   creates a table entry and increments its ref; iput()
+//   decrements ref.
+//
+// * Valid: the information (type, size, &c) in an inode
+//   table entry is only correct when ip->valid is 1.
+//   ilock() reads the inode from
+//   the disk and sets ip->valid, while iput() clears
+//   ip->valid if ip->ref has fallen to zero.
+//
+// * Locked: file system code may only examine and modify
+//   the information in an inode and its content if it
+//   has first locked the inode.
+//
+// Thus a typical sequence is:
+//   ip = iget(dev, inum)
+//   ilock(ip)
+//   ... examine and modify ip->xxx ...
+//   iunlock(ip)
+//   iput(ip)
+//
+// ilock() is separate from iget() so that system calls can
+// get a long-term reference to an inode (as for an open file)
+// and only lock it for short periods (e.g., in read()).
+// The separation also helps avoid deadlock and races during
+// pathname lookup. iget() increments ip->ref so that the inode
+// stays in the table and pointers to it remain valid.
+//
+// Many internal file system functions expect the caller to
+// have locked the inodes involved; this lets callers create
+// multi-step atomic operations.
+//
+// The itable.lock spin-lock protects the allocation of itable
+// entries. Since ip->ref indicates whether an entry is free,
+// and ip->dev and ip->inum indicate which i-node an entry
+// holds, one must hold itable.lock while using any of those fields.
+//
+// An ip->lock sleep-lock protects all ip-> fields other than ref,
+// dev, and inum.  One must hold ip->lock in order to
+// read or write that inode's ip->valid, ip->size, ip->type, &c.
+
+struct {
+  struct spinlock lock;
+  struct inode inode[NINODE];
+} itable;
+
+void
+iinit()
+{
+  int i = 0;
+  
+  initlock(&itable.lock, "itable");
+  for(i = 0; i < NINODE; i++) {
+    initsleeplock(&itable.inode[i].lock, "inode");
+  }
+}
+
+static struct inode* iget(uint dev, uint inum);
+
+// Allocate an inode on device dev.
+// Mark it as allocated by  giving it type type.
+// Returns an unlocked but allocated and referenced inode,
+// or NULL if there is no free inode.
+struct inode*
+ialloc(uint dev, short type)
+{
+  int inum;
+  struct buf *bp;
+  struct dinode *dip;
+
+  for(inum = 1; inum < sb.ninodes; inum++){
+    bp = bread(dev, IBLOCK(inum, sb));
+    dip = (struct dinode*)bp->data + inum%IPB;
+    if(dip->type == 0){  // a free inode
+      memset(dip, 0, sizeof(*dip));
+      dip->type = type;
+      log_write(bp);   // mark it allocated on the disk
+      brelse(bp);
+      return iget(dev, inum);
+    }
+    brelse(bp);
+  }
+  printf("ialloc: no inodes\n");
+  return 0;
+}
+
+// Copy a modified in-memory inode to disk.
+// Must be called after every change to an ip->xxx field
+// that lives on disk.
+// Caller must hold ip->lock.
+void
+iupdate(struct inode *ip)
+{
+  struct buf *bp;
+  struct dinode *dip;
+
+  bp = bread(ip->dev, IBLOCK(ip->inum, sb));
+  dip = (struct dinode*)bp->data + ip->inum%IPB;
+  dip->type = ip->type;
+  dip->major = ip->major;
+  dip->minor = ip->minor;
+  dip->nlink = ip->nlink;
+  dip->size = ip->size;
+  memmove(dip->addrs, ip->addrs, sizeof(ip->addrs));
+  log_write(bp);
+  brelse(bp);
+}
+
+// Find the inode with number inum on device dev
+// and return the in-memory copy. Does not lock
+// the inode and does not read it from disk.
+static struct inode*
+iget(uint dev, uint inum)
+{
+  struct inode *ip, *empty;
+
+  acquire(&itable.lock);
+
+  // Is the inode already in the table?
+  empty = 0;
+  for(ip = &itable.inode[0]; ip < &itable.inode[NINODE]; ip++){
+    if(ip->ref > 0 && ip->dev == dev && ip->inum == inum){
+      ip->ref++;
+      release(&itable.lock);
+      return ip;
+    }
+    if(empty == 0 && ip->ref == 0)    // Remember empty slot.
+      empty = ip;
+  }
+
+  // Recycle an inode entry.
+  if(empty == 0)
+    panic("iget: no inodes");
+
+  ip = empty;
+  ip->dev = dev;
+  ip->inum = inum;
+  ip->ref = 1;
+  ip->valid = 0;
+  release(&itable.lock);
+
+  return ip;
+}
+
+// Increment reference count for ip.
+// Returns ip to enable ip = idup(ip1) idiom.
+struct inode*
+idup(struct inode *ip)
+{
+  acquire(&itable.lock);
+  ip->ref++;
+  release(&itable.lock);
+  return ip;
+}
+
+// Lock the given inode.
+// Reads the inode from disk if necessary.
+void
+ilock(struct inode *ip)
+{
+  struct buf *bp;
+  struct dinode *dip;
+
+  if(ip == 0 || ip->ref < 1)
+    panic("ilock");
+
+  acquiresleep(&ip->lock);
+
+  if(ip->valid == 0){
+    bp = bread(ip->dev, IBLOCK(ip->inum, sb));
+    dip = (struct dinode*)bp->data + ip->inum%IPB;
+    ip->type = dip->type;
+    ip->major = dip->major;
+    ip->minor = dip->minor;
+    ip->nlink = dip->nlink;
+    ip->size = dip->size;
+    memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
+    brelse(bp);
+    ip->valid = 1;
+    if(ip->type == 0)
+      panic("ilock: no type");
+  }
+}
+
+// Unlock the given inode.
+void
+iunlock(struct inode *ip)
+{
+  if(ip == 0 || !holdingsleep(&ip->lock) || ip->ref < 1)
+    panic("iunlock");
+
+  releasesleep(&ip->lock);
+}
+
+// Drop a reference to an in-memory inode.
+// If that was the last reference, the inode table entry can
+// be recycled.
+// If that was the last reference and the inode has no links
+// to it, free the inode (and its content) on disk.
+// All calls to iput() must be inside a transaction in
+// case it has to free the inode.
+void
+iput(struct inode *ip)
+{
+  acquire(&itable.lock);
+
+  if(ip->ref == 1 && ip->valid && ip->nlink == 0){
+    // inode has no links and no other references: truncate and free.
+
+    // ip->ref == 1 means no other process can have ip locked,
+    // so this acquiresleep() won't block (or deadlock).
+    acquiresleep(&ip->lock);
+
+    release(&itable.lock);
+
+    itrunc(ip);
+    ip->type = 0;
+    iupdate(ip);
+    ip->valid = 0;
+
+    releasesleep(&ip->lock);
+
+    acquire(&itable.lock);
+  }
+
+  ip->ref--;
+  release(&itable.lock);
+}
+
+// Common idiom: unlock, then put.
+void
+iunlockput(struct inode *ip)
+{
+  iunlock(ip);
+  iput(ip);
+}
+
+// Inode content
+//
+// The content (data) associated with each inode is stored
+// in blocks on the disk. The first NDIRECT block numbers
+// are listed in ip->addrs[].  The next NINDIRECT blocks are
+// listed in block ip->addrs[NDIRECT].
+
+// Return the disk block address of the nth block in inode ip.
+// If there is no such block, bmap allocates one.
+// returns 0 if out of disk space.
+static uint
+bmap(struct inode *ip, uint bn)
+{
+  uint addr, *a;
+  struct buf *bp;
+
+  if(bn < NDIRECT){
+    if((addr = ip->addrs[bn]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0)
+        return 0;
+      ip->addrs[bn] = addr;
+    }
+    return addr;
+  }
+  bn -= NDIRECT;
+
+  if(bn < NINDIRECT){
+    // Load indirect block, allocating if necessary.
+    if((addr = ip->addrs[NDIRECT]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0)
+        return 0;
+      ip->addrs[NDIRECT] = addr;
+    }
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    if((addr = a[bn]) == 0){
+      addr = balloc(ip->dev);
+      if(addr){
+        a[bn] = addr;
+        log_write(bp);
+      }
+    }
+    brelse(bp);
+    return addr;
+  }
+
+  panic("bmap: out of range");
+}
+
+// Truncate inode (discard contents).
+// Caller must hold ip->lock.
+void
+itrunc(struct inode *ip)
+{
+  int i, j;
+  struct buf *bp;
+  uint *a;
+
+  for(i = 0; i < NDIRECT; i++){
+    if(ip->addrs[i]){
+      bfree(ip->dev, ip->addrs[i]);
+      ip->addrs[i] = 0;
+    }
+  }
+
+  if(ip->addrs[NDIRECT]){
+    bp = bread(ip->dev, ip->addrs[NDIRECT]);
+    a = (uint*)bp->data;
+    for(j = 0; j < NINDIRECT; j++){
+      if(a[j])
+        bfree(ip->dev, a[j]);
+    }
+    brelse(bp);
+    bfree(ip->dev, ip->addrs[NDIRECT]);
+    ip->addrs[NDIRECT] = 0;
+  }
+
+  ip->size = 0;
+  iupdate(ip);
+}
+
+// Copy stat information from inode.
+// Caller must hold ip->lock.
+void
+stati(struct inode *ip, struct stat *st)
+{
+  st->dev = ip->dev;
+  st->ino = ip->inum;
+  st->type = ip->type;
+  st->nlink = ip->nlink;
+  st->size = ip->size;
+}
+
+// Read data from inode.
+// Caller must hold ip->lock.
+// If user_dst==1, then dst is a user virtual address;
+// otherwise, dst is a kernel address.
+int
+readi(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
+{
+  uint tot, m;
+  struct buf *bp;
+
+  if(off > ip->size || off + n < off)
+    return 0;
+  if(off + n > ip->size)
+    n = ip->size - off;
+
+  for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
+    uint addr = bmap(ip, off/BSIZE);
+    if(addr == 0)
+      break;
+    bp = bread(ip->dev, addr);
+    m = min(n - tot, BSIZE - off%BSIZE);
+    if(either_copyout(user_dst, dst, bp->data + (off % BSIZE), m) == -1) {
+      brelse(bp);
+      tot = -1;
+      break;
+    }
+    brelse(bp);
+  }
+  return tot;
+}
+
+// Write data to inode.
+// Caller must hold ip->lock.
+// If user_src==1, then src is a user virtual address;
+// otherwise, src is a kernel address.
+// Returns the number of bytes successfully written.
+// If the return value is less than the requested n,
+// there was an error of some kind.
+int
+writei(struct inode *ip, int user_src, uint64 src, uint off, uint n)
+{
+  uint tot, m;
+  struct buf *bp;
+
+  if(off > ip->size || off + n < off)
+    return -1;
+  if(off + n > MAXFILE*BSIZE)
+    return -1;
+
+  for(tot=0; tot<n; tot+=m, off+=m, src+=m){
+    uint addr = bmap(ip, off/BSIZE);
+    if(addr == 0)
+      break;
+    bp = bread(ip->dev, addr);
+    m = min(n - tot, BSIZE - off%BSIZE);
+    if(either_copyin(bp->data + (off % BSIZE), user_src, src, m) == -1) {
+      brelse(bp);
+      break;
+    }
+    log_write(bp);
+    brelse(bp);
+  }
+
+  if(off > ip->size)
+    ip->size = off;
+
+  // write the i-node back to disk even if the size didn't change
+  // because the loop above might have called bmap() and added a new
+  // block to ip->addrs[].
+  iupdate(ip);
+
+  return tot;
+}
+
+// Directories
+
+int
+namecmp(const char *s, const char *t)
+{
+  return strncmp(s, t, DIRSIZ);
+}
+
+// Look for a directory entry in a directory.
+// If found, set *poff to byte offset of entry.
+struct inode*
+dirlookup(struct inode *dp, char *name, uint *poff)
+{
+  uint off, inum;
+  struct dirent de;
+
+  if(dp->type != T_DIR)
+    panic("dirlookup not DIR");
+
+  for(off = 0; off < dp->size; off += sizeof(de)){
+    if(readi(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+      panic("dirlookup read");
+    if(de.inum == 0)
+      continue;
+    if(namecmp(name, de.name) == 0){
+      // entry matches path element
+      if(poff)
+        *poff = off;
+      inum = de.inum;
+      return iget(dp->dev, inum);
+    }
+  }
+
+  return 0;
+}
+
+// Write a new directory entry (name, inum) into the directory dp.
+// Returns 0 on success, -1 on failure (e.g. out of disk blocks).
+int
+dirlink(struct inode *dp, char *name, uint inum)
+{
+  int off;
+  struct dirent de;
+  struct inode *ip;
+
+  // Check that name is not present.
+  if((ip = dirlookup(dp, name, 0)) != 0){
+    iput(ip);
+    return -1;
+  }
+
+  // Look for an empty dirent.
+  for(off = 0; off < dp->size; off += sizeof(de)){
+    if(readi(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+      panic("dirlink read");
+    if(de.inum == 0)
+      break;
+  }
+
+  strncpy(de.name, name, DIRSIZ);
+  de.inum = inum;
+  if(writei(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+    return -1;
+
+  return 0;
+}
+
+// Paths
+
+// Copy the next path element from path into name.
+// Return a pointer to the element following the copied one.
+// The returned path has no leading slashes,
+// so the caller can check *path=='\0' to see if the name is the last one.
+// If no name to remove, return 0.
+//
+// Examples:
+//   skipelem("a/bb/c", name) = "bb/c", setting name = "a"
+//   skipelem("///a//bb", name) = "bb", setting name = "a"
+//   skipelem("a", name) = "", setting name = "a"
+//   skipelem("", name) = skipelem("////", name) = 0
+//
+static char*
+skipelem(char *path, char *name)
+{
+  char *s;
+  int len;
+
+  while(*path == '/')
+    path++;
+  if(*path == 0)
+    return 0;
+  s = path;
+  while(*path != '/' && *path != 0)
+    path++;
+  len = path - s;
+  if(len >= DIRSIZ)
+    memmove(name, s, DIRSIZ);
+  else {
+    memmove(name, s, len);
+    name[len] = 0;
+  }
+  while(*path == '/')
+    path++;
+  return path;
+}
+
+// Look up and return the inode for a path name.
+// If parent != 0, return the inode for the parent and copy the final
+// path element into name, which must have room for DIRSIZ bytes.
+// Must be called inside a transaction since it calls iput().
+static struct inode*
+namex(char *path, int nameiparent, char *name)
+{
+  struct inode *ip, *next;
+
+  if(*path == '/')
+    ip = iget(ROOTDEV, ROOTINO);
+  else
+    ip = idup(myproc()->cwd);
+
+  while((path = skipelem(path, name)) != 0){
+    ilock(ip);
+    if(ip->type != T_DIR){
+      iunlockput(ip);
+      return 0;
+    }
+    if(nameiparent && *path == '\0'){
+      // Stop one level early.
+      iunlock(ip);
+      return ip;
+    }
+    if((next = dirlookup(ip, name, 0)) == 0){
+      iunlockput(ip);
+      return 0;
+    }
+    iunlockput(ip);
+    ip = next;
+  }
+  if(nameiparent){
+    iput(ip);
+    return 0;
+  }
+  return ip;
+}
+
+struct inode*
+namei(char *path)
+{
+  char name[DIRSIZ];
+  return namex(path, 0, name);
+}
+
+struct inode*
+nameiparent(char *path, char *name)
+{
+  return namex(path, 1, name);
+}
+// Physical memory allocator, for user processes,
+// kernel stacks, page-table pages,
+// and pipe buffers. Allocates whole 4096-byte pages.
+
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "spinlock.h"
+#include "riscv.h"
+#include "defs.h"
+
+void freerange(void *pa_start, void *pa_end);
+
+extern char end[]; // first address after kernel.
+                   // defined by kernel.ld.
+
+
+// we are creating a linked list which has pointers to free pages
+// the *next is a pointer pointing to the next memory page
+struct run {
+  struct run *next;
+};
+
+// the frelist contains all the free memory pages, we need to get count 
+//spinlock ensures thread safety
+struct {
+  struct spinlock lock;
+  struct run *freelist;
+} kmem;
+
+void
+kinit()
+{
+  initlock(&kmem.lock, "kmem");
+  freerange(end, (void*)PHYSTOP);
+}
+
+void
+freerange(void *pa_start, void *pa_end)
+{
+  char *p;
+  p = (char*)PGROUNDUP((uint64)pa_start);
+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+    kfree(p);
+}
+
+// Free the page of physical memory pointed at by pa,
+// which normally should have been returned by a
+// call to kalloc().  (The exception is when
+// initializing the allocator; see kinit above.)
+void
+kfree(void *pa)
+{
+  struct run *r;
+
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    panic("kfree");
+
+  // Fill with junk to catch dangling refs.
+  memset(pa, 1, PGSIZE);
+
+  r = (struct run*)pa;
+
+//  acquire(&kmem.lock);
+  r->next = kmem.freelist;
+  kmem.freelist = r;
+//  release(&kmem.lock);
+}
+
+// Allocate one 4096-byte page of physical memory.
+// Returns a pointer that the kernel can use.
+// Returns 0 if the memory cannot be allocated.
+void *
+kalloc(void)
+{
+  struct run *r;
+
+  acquire(&kmem.lock);
+  r = kmem.freelist;
+  if(r)
+    kmem.freelist = r->next;
+  release(&kmem.lock);
+
+  if(r)
+    memset((char*)r, 5, PGSIZE); // fill with junk
+  return (void*)r;
+}
+
+// this 
+int
+countpages()
+{
+    int count = 0;
+
+    struct run *r;
+// the free list structure has pointers to the avaliable free memory pages
+    acquire(&kmem.lock);
+    r = kmem.freelist;
+
+    //iterate over linked list until it ends
+    while (r != 0) {
+        count += 1;
+        r = r->next;
+    }
+
+    release(&kmem.lock);
+
+    return count;
+}
+#include "types.h"
+#include "riscv.h"
+#include "defs.h"
+#include "param.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "buf.h"
+
+// Simple logging that allows concurrent FS system calls.
+//
+// A log transaction contains the updates of multiple FS system
+// calls. The logging system only commits when there are
+// no FS system calls active. Thus there is never
+// any reasoning required about whether a commit might
+// write an uncommitted system call's updates to disk.
+//
+// A system call should call begin_op()/end_op() to mark
+// its start and end. Usually begin_op() just increments
+// the count of in-progress FS system calls and returns.
+// But if it thinks the log is close to running out, it
+// sleeps until the last outstanding end_op() commits.
+//
+// The log is a physical re-do log containing disk blocks.
+// The on-disk log format:
+//   header block, containing block #s for block A, B, C, ...
+//   block A
+//   block B
+//   block C
+//   ...
+// Log appends are synchronous.
+
+// Contents of the header block, used for both the on-disk header block
+// and to keep track in memory of logged block# before commit.
+struct logheader {
+  int n;
+  int block[LOGSIZE];
+};
+
+struct log {
+  struct spinlock lock;
+  int start;
+  int size;
+  int outstanding; // how many FS sys calls are executing.
+  int committing;  // in commit(), please wait.
+  int dev;
+  struct logheader lh;
+};
+struct log log;
+
+static void recover_from_log(void);
+static void commit();
+
+void
+initlog(int dev, struct superblock *sb)
+{
+  if (sizeof(struct logheader) >= BSIZE)
+    panic("initlog: too big logheader");
+
+  initlock(&log.lock, "log");
+  log.start = sb->logstart;
+  log.size = sb->nlog;
+  log.dev = dev;
+  recover_from_log();
+}
+
+// Copy committed blocks from log to their home location
+static void
+install_trans(int recovering)
+{
+  int tail;
+
+  for (tail = 0; tail < log.lh.n; tail++) {
+    struct buf *lbuf = bread(log.dev, log.start+tail+1); // read log block
+    struct buf *dbuf = bread(log.dev, log.lh.block[tail]); // read dst
+    memmove(dbuf->data, lbuf->data, BSIZE);  // copy block to dst
+    bwrite(dbuf);  // write dst to disk
+    if(recovering == 0)
+      bunpin(dbuf);
+    brelse(lbuf);
+    brelse(dbuf);
+  }
+}
+
+// Read the log header from disk into the in-memory log header
+static void
+read_head(void)
+{
+  struct buf *buf = bread(log.dev, log.start);
+  struct logheader *lh = (struct logheader *) (buf->data);
+  int i;
+  log.lh.n = lh->n;
+  for (i = 0; i < log.lh.n; i++) {
+    log.lh.block[i] = lh->block[i];
+  }
+  brelse(buf);
+}
+
+// Write in-memory log header to disk.
+// This is the true point at which the
+// current transaction commits.
+static void
+write_head(void)
+{
+  struct buf *buf = bread(log.dev, log.start);
+  struct logheader *hb = (struct logheader *) (buf->data);
+  int i;
+  hb->n = log.lh.n;
+  for (i = 0; i < log.lh.n; i++) {
+    hb->block[i] = log.lh.block[i];
+  }
+  bwrite(buf);
+  brelse(buf);
+}
+
+static void
+recover_from_log(void)
+{
+  read_head();
+  install_trans(1); // if committed, copy from log to disk
+  log.lh.n = 0;
+  write_head(); // clear the log
+}
+
+// called at the start of each FS system call.
+void
+begin_op(void)
+{
+  acquire(&log.lock);
+  while(1){
+    if(log.committing){
+      sleep(&log, &log.lock);
+    } else if(log.lh.n + (log.outstanding+1)*MAXOPBLOCKS > LOGSIZE){
+      // this op might exhaust log space; wait for commit.
+      sleep(&log, &log.lock);
+    } else {
+      log.outstanding += 1;
+      release(&log.lock);
+      break;
+    }
+  }
+}
+
+// called at the end of each FS system call.
+// commits if this was the last outstanding operation.
+void
+end_op(void)
+{
+  int do_commit = 0;
+
+  acquire(&log.lock);
+  log.outstanding -= 1;
+  if(log.committing)
+    panic("log.committing");
+  if(log.outstanding == 0){
+    do_commit = 1;
+    log.committing = 1;
+  } else {
+    // begin_op() may be waiting for log space,
+    // and decrementing log.outstanding has decreased
+    // the amount of reserved space.
+    wakeup(&log);
+  }
+  release(&log.lock);
+
+  if(do_commit){
+    // call commit w/o holding locks, since not allowed
+    // to sleep with locks.
+    commit();
+    acquire(&log.lock);
+    log.committing = 0;
+    wakeup(&log);
+    release(&log.lock);
+  }
+}
+
+// Copy modified blocks from cache to log.
+static void
+write_log(void)
+{
+  int tail;
+
+  for (tail = 0; tail < log.lh.n; tail++) {
+    struct buf *to = bread(log.dev, log.start+tail+1); // log block
+    struct buf *from = bread(log.dev, log.lh.block[tail]); // cache block
+    memmove(to->data, from->data, BSIZE);
+    bwrite(to);  // write the log
+    brelse(from);
+    brelse(to);
+  }
+}
+
+static void
+commit()
+{
+  if (log.lh.n > 0) {
+    write_log();     // Write modified blocks from cache to log
+    write_head();    // Write header to disk -- the real commit
+    install_trans(0); // Now install writes to home locations
+    log.lh.n = 0;
+    write_head();    // Erase the transaction from the log
+  }
+}
+
+// Caller has modified b->data and is done with the buffer.
+// Record the block number and pin in the cache by increasing refcnt.
+// commit()/write_log() will do the disk write.
+//
+// log_write() replaces bwrite(); a typical use is:
+//   bp = bread(...)
+//   modify bp->data[]
+//   log_write(bp)
+//   brelse(bp)
+void
+log_write(struct buf *b)
+{
+  int i;
+
+  acquire(&log.lock);
+  if (log.lh.n >= LOGSIZE || log.lh.n >= log.size - 1)
+    panic("too big a transaction");
+  if (log.outstanding < 1)
+    panic("log_write outside of trans");
+
+  for (i = 0; i < log.lh.n; i++) {
+    if (log.lh.block[i] == b->blockno)   // log absorption
+      break;
+  }
+  log.lh.block[i] = b->blockno;
+  if (i == log.lh.n) {  // Add new block to log?
+    bpin(b);
+    log.lh.n++;
+  }
+  release(&log.lock);
+}
+
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "defs.h"
+#include "sha256.h" // Your hash function header
+
+// <<< ADD THESE LINES >>>
+// Declare the embedded data and its length (defined in kernel/embedded_sleeplock.c)
+// These variables are created by the xxd command in the Makefile.
+extern unsigned char kernel_subset_sources_tmp[];
+extern unsigned int kernel_subset_sources_tmp_len;
+// <<< END OF ADDED LINES >>>
+
+volatile static int started = 0;
+
+// Function prototype for byte_to_hex (if not already in defs.h)
+// Ensure this function is defined somewhere accessible (e.g., kernel/printf.c)
+void byte_to_hex(uint8 b, char *hex);
+
+// start() jumps here in supervisor mode on all CPUs.
+void
+main()
+{
+  if(cpuid() == 0){
+    consoleinit();
+    printfinit();
+    printf("\n");
+    printf("xv6 kernel is booting\n");
+    printf("\n");
+    printf("\n");
+    kinit();         // physical page allocator
+    kvminit();       // create kernel page table
+    kvminithart();   // turn on paging
+    procinit();      // process table
+    trapinit();      // trap vectors
+    trapinithart();  // install kernel trap vector
+    plicinit();      // set up interrupt controller
+    plicinithart();  // ask PLIC for device interrupts
+    binit();         // buffer cache
+    iinit();         // inode table
+    fileinit();      // file table
+    virtio_disk_init(); // emulated hard disk
+
+
+//----------------------------------------------SHA256 FOR EMBEDDED KERNEL FILE CONTENT
+    uint8 hash[32];          // Buffer for the SHA-256 output
+    SHA256_CTX ctx;          // SHA-256 context
+    char hex_output[65];     // Buffer for the hexadecimal hash string
+    int i;
+
+    // Use the embedded data declared above
+    printf("Length of all kernel files =%d\n ",  kernel_subset_sources_tmp_len);
+
+    int start_time = r_time(); // Assuming r_time() is your function to get time ticks
+    // SHA-256 computation steps
+    sha256_init(&ctx);                            // Initialize SHA-256 context
+
+    // Use the embedded array and its length directly from memory
+   sha256_update(&ctx, (uint8*)kernel_subset_sources_tmp, kernel_subset_sources_tmp_len);
+
+
+    sha256_final(&ctx, hash);                     // Finalize the hash
+    int end_time = r_time(); // Assuming r_time() is your function to get time ticks
+
+    int final_time = end_time - start_time;
+
+    // Convert hash to hexadecimal string (assuming byte_to_hex exists)
+    // Ensure byte_to_hex is defined (e.g., in kernel/printf.c or kernel/utils.c)
+    // and declared (e.g., in kernel/defs.h or above main here)
+    for (i = 0; i < 32; i++) {
+         byte_to_hex(hash[i], &hex_output[i * 2]);
+    }
+    hex_output[64] = '\0';  // Null-terminate the string
+
+    store_boot_hash(hex_output);
+    // Print the hash
+    printf("SHA-256 of all kernel files: %s\n", hex_output);
+    printf("Computed in Ticks = %d\n", final_time);
+//------------------------------------------------SHA256 FOR EMBEDDED KERNEL FILE CONTENT
+
+
+    // comments related to previous implementation (can be kept or removed)
+    // could make this code into a function in proc.c for cleaner implementation --@Qamar
+    // we cannot give input to the kernel space implementation as that would have to be given from the userspace --@Qamar
+
+    printf("\n");
+    printf("\n");
+
+    // these print statements are added to provide instructions and for cleanness --@Qamar
+    printf("-------Use sha256 sample.txt for user space implementation\n");
+    printf("-------Use sha_syscall {string to be hashed} for system call implementation\n");
+    printf("-------Use to validate =  cat kernel/bio.c kernel/console.c kernel/exec.c kernel/file.c kernel/fs.c kernel/kalloc.c kernel/log.c kernel/main.c kernel/pipe.c kernel/plic.c kernel/printf.c kernel/proc.c kernel/sha256.c kernel/sleeplock.c kernel/spinlock.c kernel/start.c kernel/string.c kernel/syscall.c kernel/sysfile.c kernel/sysproc.c kernel/trap.c kernel/uart.c kernel/virtio_disk.c kernel/vm.c | sha256sum\n");
+    
+
+    printf("\n");
+    printf("\n");
+
+    // comments related to userinit (can be kept or removed)
+    // userinit calls the function in proc.c which then goes into the initcode.S and this calls exec syscall to execute the user process /init --@Qamar
+    // hence userinit takes us into the userspace, so we have to call sha256 before userinit --@Qamar
+    // every process starts in the userspace. For sha256 in kernel space we need the execution to not be a process --@Qamar
+    userinit();      // first user process
+
+    __sync_synchronize();
+    started = 1;
+
+  } else {
+    while(started == 0)
+      ;
+    __sync_synchronize();
+    printf("hart %d starting\n", cpuid());
+    kvminithart();    // turn on paging
+    trapinithart();   // install kernel trap vector
+    plicinithart();   // ask PLIC for device interrupts
+  }
+
+  scheduler();
+}
+
+
+/*
+// --- Example definition for byte_to_hex ---
+// You might need to place this definition in a suitable file (like kernel/printf.c or kernel/string.c)
+// and declare it in kernel/defs.h if it's not already available.
+// Make sure it doesn't conflict with existing functions.
+
+void
+byte_to_hex(uint8 b, char *hex) {
+    static const char hex_chars[] = "0123456789abcdef";
+    hex[0] = hex_chars[(b >> 4) & 0xF];
+    hex[1] = hex_chars[b & 0xF];
+    // hex[2] should be set to '\0' by the caller if printing single bytes,
+    // but the loop in main handles the final null termination for the full string.
+}
+*/
+#include "types.h"
+#include "riscv.h"
+#include "defs.h"
+#include "param.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+
+#define PIPESIZE 512
+
+struct pipe {
+  struct spinlock lock;
+  char data[PIPESIZE];
+  uint nread;     // number of bytes read
+  uint nwrite;    // number of bytes written
+  int readopen;   // read fd is still open
+  int writeopen;  // write fd is still open
+};
+
+int
+pipealloc(struct file **f0, struct file **f1)
+{
+  struct pipe *pi;
+
+  pi = 0;
+  *f0 = *f1 = 0;
+  if((*f0 = filealloc()) == 0 || (*f1 = filealloc()) == 0)
+    goto bad;
+  if((pi = (struct pipe*)kalloc()) == 0)
+    goto bad;
+  pi->readopen = 1;
+  pi->writeopen = 1;
+  pi->nwrite = 0;
+  pi->nread = 0;
+  initlock(&pi->lock, "pipe");
+  (*f0)->type = FD_PIPE;
+  (*f0)->readable = 1;
+  (*f0)->writable = 0;
+  (*f0)->pipe = pi;
+  (*f1)->type = FD_PIPE;
+  (*f1)->readable = 0;
+  (*f1)->writable = 1;
+  (*f1)->pipe = pi;
+  return 0;
+
+ bad:
+  if(pi)
+    kfree((char*)pi);
+  if(*f0)
+    fileclose(*f0);
+  if(*f1)
+    fileclose(*f1);
+  return -1;
+}
+
+void
+pipeclose(struct pipe *pi, int writable)
+{
+  acquire(&pi->lock);
+  if(writable){
+    pi->writeopen = 0;
+    wakeup(&pi->nread);
+  } else {
+    pi->readopen = 0;
+    wakeup(&pi->nwrite);
+  }
+  if(pi->readopen == 0 && pi->writeopen == 0){
+    release(&pi->lock);
+    kfree((char*)pi);
+  } else
+    release(&pi->lock);
+}
+
+int
+pipewrite(struct pipe *pi, uint64 addr, int n)
+{
+  int i = 0;
+  struct proc *pr = myproc();
+
+  acquire(&pi->lock);
+  while(i < n){
+    if(pi->readopen == 0 || killed(pr)){
+      release(&pi->lock);
+      return -1;
+    }
+    if(pi->nwrite == pi->nread + PIPESIZE){ //DOC: pipewrite-full
+      wakeup(&pi->nread);
+      sleep(&pi->nwrite, &pi->lock);
+    } else {
+      char ch;
+      if(copyin(pr->pagetable, &ch, addr + i, 1) == -1)
+        break;
+      pi->data[pi->nwrite++ % PIPESIZE] = ch;
+      i++;
+    }
+  }
+  wakeup(&pi->nread);
+  release(&pi->lock);
+
+  return i;
+}
+
+int
+piperead(struct pipe *pi, uint64 addr, int n)
+{
+  int i;
+  struct proc *pr = myproc();
+  char ch;
+
+  acquire(&pi->lock);
+  while(pi->nread == pi->nwrite && pi->writeopen){  //DOC: pipe-empty
+    if(killed(pr)){
+      release(&pi->lock);
+      return -1;
+    }
+    sleep(&pi->nread, &pi->lock); //DOC: piperead-sleep
+  }
+  for(i = 0; i < n; i++){  //DOC: piperead-copy
+    if(pi->nread == pi->nwrite)
+      break;
+    ch = pi->data[pi->nread++ % PIPESIZE];
+    if(copyout(pr->pagetable, addr + i, &ch, 1) == -1)
+      break;
+  }
+  wakeup(&pi->nwrite);  //DOC: piperead-wakeup
+  release(&pi->lock);
+  return i;
+}
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "defs.h"
+
+//
+// the riscv Platform Level Interrupt Controller (PLIC).
+//
+
+void
+plicinit(void)
+{
+  // set desired IRQ priorities non-zero (otherwise disabled).
+  *(uint32*)(PLIC + UART0_IRQ*4) = 1;
+  *(uint32*)(PLIC + VIRTIO0_IRQ*4) = 1;
+}
+
+void
+plicinithart(void)
+{
+  int hart = cpuid();
+  
+  // set enable bits for this hart's S-mode
+  // for the uart and virtio disk.
+  *(uint32*)PLIC_SENABLE(hart) = (1 << UART0_IRQ) | (1 << VIRTIO0_IRQ);
+
+  // set this hart's S-mode priority threshold to 0.
+  *(uint32*)PLIC_SPRIORITY(hart) = 0;
+}
+
+// ask the PLIC what interrupt we should serve.
+int
+plic_claim(void)
+{
+  int hart = cpuid();
+  int irq = *(uint32*)PLIC_SCLAIM(hart);
+  return irq;
+}
+
+// tell the PLIC we've served this IRQ.
+void
+plic_complete(int irq)
+{
+  int hart = cpuid();
+  *(uint32*)PLIC_SCLAIM(hart) = irq;
+}
+//
+// formatted console output -- printf, panic.
+//
+
+#include <stdarg.h>
+
+#include "types.h"
+#include "param.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "defs.h"
+#include "proc.h"
+
+volatile int panicked = 0;
+
+// lock to avoid interleaving concurrent printf's.
+static struct {
+  struct spinlock lock;
+  int locking;
+} pr;
+
+static char digits[] = "0123456789abcdef";
+
+static void
+printint(long long xx, int base, int sign)
+{
+  char buf[16];
+  int i;
+  unsigned long long x;
+
+  if(sign && (sign = (xx < 0)))
+    x = -xx;
+  else
+    x = xx;
+
+  i = 0;
+  do {
+    buf[i++] = digits[x % base];
+  } while((x /= base) != 0);
+
+  if(sign)
+    buf[i++] = '-';
+
+  while(--i >= 0)
+    consputc(buf[i]);
+}
+
+static void
+printptr(uint64 x)
+{
+  int i;
+  consputc('0');
+  consputc('x');
+  for (i = 0; i < (sizeof(uint64) * 2); i++, x <<= 4)
+    consputc(digits[x >> (sizeof(uint64) * 8 - 4)]);
+}
+
+// Print to the console.
+int
+printf(char *fmt, ...)
+{
+  va_list ap;
+  int i, cx, c0, c1, c2, locking;
+  char *s;
+
+  locking = pr.locking;
+  if(locking)
+    acquire(&pr.lock);
+
+  va_start(ap, fmt);
+  for(i = 0; (cx = fmt[i] & 0xff) != 0; i++){
+    if(cx != '%'){
+      consputc(cx);
+      continue;
+    }
+    i++;
+    c0 = fmt[i+0] & 0xff;
+    c1 = c2 = 0;
+    if(c0) c1 = fmt[i+1] & 0xff;
+    if(c1) c2 = fmt[i+2] & 0xff;
+    if(c0 == 'd'){
+      printint(va_arg(ap, int), 10, 1);
+    } else if(c0 == 'l' && c1 == 'd'){
+      printint(va_arg(ap, uint64), 10, 1);
+      i += 1;
+    } else if(c0 == 'l' && c1 == 'l' && c2 == 'd'){
+      printint(va_arg(ap, uint64), 10, 1);
+      i += 2;
+    } else if(c0 == 'u'){
+      printint(va_arg(ap, int), 10, 0);
+    } else if(c0 == 'l' && c1 == 'u'){
+      printint(va_arg(ap, uint64), 10, 0);
+      i += 1;
+    } else if(c0 == 'l' && c1 == 'l' && c2 == 'u'){
+      printint(va_arg(ap, uint64), 10, 0);
+      i += 2;
+    } else if(c0 == 'x'){
+      printint(va_arg(ap, int), 16, 0);
+    } else if(c0 == 'l' && c1 == 'x'){
+      printint(va_arg(ap, uint64), 16, 0);
+      i += 1;
+    } else if(c0 == 'l' && c1 == 'l' && c2 == 'x'){
+      printint(va_arg(ap, uint64), 16, 0);
+      i += 2;
+    } else if(c0 == 'p'){
+      printptr(va_arg(ap, uint64));
+    } else if(c0 == 's'){
+      if((s = va_arg(ap, char*)) == 0)
+        s = "(null)";
+      for(; *s; s++)
+        consputc(*s);
+    } else if(c0 == '%'){
+      consputc('%');
+    } else if(c0 == 0){
+      break;
+    } else {
+      // Print unknown % sequence to draw attention.
+      consputc('%');
+      consputc(c0);
+    }
+
+#if 0
+    switch(c){
+    case 'd':
+      printint(va_arg(ap, int), 10, 1);
+      break;
+    case 'x':
+      printint(va_arg(ap, int), 16, 1);
+      break;
+    case 'p':
+      printptr(va_arg(ap, uint64));
+      break;
+    case 's':
+      if((s = va_arg(ap, char*)) == 0)
+        s = "(null)";
+      for(; *s; s++)
+        consputc(*s);
+      break;
+    case '%':
+      consputc('%');
+      break;
+    default:
+      // Print unknown % sequence to draw attention.
+      consputc('%');
+      consputc(c);
+      break;
+    }
+#endif
+  }
+  va_end(ap);
+
+  if(locking)
+    release(&pr.lock);
+
+  return 0;
+}
+
+void
+panic(char *s)
+{
+  pr.locking = 0;
+  printf("panic: ");
+  printf("%s\n", s);
+  panicked = 1; // freeze uart output from other CPUs
+  for(;;)
+    ;
+}
+
+void
+printfinit(void)
+{
+  initlock(&pr.lock, "pr");
+  pr.locking = 1;
+}
 #include "types.h"
 #include "param.h"
 #include "memlayout.h"
@@ -532,162 +2231,3265 @@ filewrite(struct file *f, uint64 addr, int n)
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
-#include "elf.h"
+#include "sha256.h"
 
-static int loadseg(pde_t *, uint64, struct inode *, uint, uint);
+struct cpu cpus[NCPU];
 
-int flags2perm(int flags)
+struct proc proc[NPROC];
+
+struct proc *initproc;
+
+int nextpid = 1;
+struct spinlock pid_lock;
+
+extern void forkret(void);
+static void freeproc(struct proc *p);
+
+extern char trampoline[]; // trampoline.S
+
+// helps ensure that wakeups of wait()ing
+// parents are not lost. helps obey the
+// memory model when using p->parent.
+// must be acquired before any p->lock.
+struct spinlock wait_lock;
+
+// Allocate a page for each process's kernel stack.
+// Map it high in memory, followed by an invalid
+// guard page.
+void
+proc_mapstacks(pagetable_t kpgtbl)
 {
-    int perm = 0;
-    if(flags & 0x1)
-      perm = PTE_X;
-    if(flags & 0x2)
-      perm |= PTE_W;
-    return perm;
+  struct proc *p;
+  
+  for(p = proc; p < &proc[NPROC]; p++) {
+    char *pa = kalloc();
+    if(pa == 0)
+      panic("kalloc");
+    uint64 va = KSTACK((int) (p - proc));
+    kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  }
+}
+
+// initialize the proc table.
+void
+procinit(void)
+{
+  struct proc *p;
+  
+  initlock(&pid_lock, "nextpid");
+  initlock(&wait_lock, "wait_lock");
+  for(p = proc; p < &proc[NPROC]; p++) {
+      initlock(&p->lock, "proc");
+      p->state = UNUSED;
+      p->kstack = KSTACK((int) (p - proc));
+  }
+}
+
+// Must be called with interrupts disabled,
+// to prevent race with process being moved
+// to a different CPU.
+int
+cpuid()
+{
+  int id = r_tp();
+  return id;
+}
+
+// Return this CPU's cpu struct.
+// Interrupts must be disabled.
+struct cpu*
+mycpu(void)
+{
+  int id = cpuid();
+  struct cpu *c = &cpus[id];
+  return c;
+}
+
+// Return the current struct proc *, or zero if none.
+struct proc*
+myproc(void)
+{
+  push_off();
+  struct cpu *c = mycpu();
+  struct proc *p = c->proc;
+  pop_off();
+  return p;
 }
 
 int
-exec(char *path, char **argv)
+allocpid()
 {
-  char *s, *last;
-  int i, off;
-  uint64 argc, sz = 0, sp, ustack[MAXARG], stackbase;
-  struct elfhdr elf;
-  struct inode *ip;
-  struct proghdr ph;
-  pagetable_t pagetable = 0, oldpagetable;
+  int pid;
+  
+  acquire(&pid_lock);
+  pid = nextpid;
+  nextpid = nextpid + 1;
+  release(&pid_lock);
+
+  return pid;
+}
+
+// Look in the process table for an UNUSED proc.
+// If found, initialize state required to run in the kernel,
+// and return with p->lock held.
+// If there are no free procs, or a memory allocation fails, return 0.
+static struct proc*
+allocproc(void)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == UNUSED) {
+      goto found;
+    } else {
+      release(&p->lock);
+    }
+  }
+  return 0;
+
+found:
+  p->pid = allocpid();
+  p->state = USED;
+
+  // Allocate a trapframe page.
+  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // An empty user page table.
+  p->pagetable = proc_pagetable(p);
+  if(p->pagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // Set up new context to start executing at forkret,
+  // which returns to user space.
+  memset(&p->context, 0, sizeof(p->context));
+  p->context.ra = (uint64)forkret;
+  p->context.sp = p->kstack + PGSIZE;
+
+  return p;
+}
+
+// free a proc structure and the data hanging from it,
+// including user pages.
+// p->lock must be held.
+static void
+freeproc(struct proc *p)
+{
+  if(p->trapframe)
+    kfree((void*)p->trapframe);
+  p->trapframe = 0;
+  if(p->pagetable)
+    proc_freepagetable(p->pagetable, p->sz);
+  p->pagetable = 0;
+  p->sz = 0;
+  p->pid = 0;
+  p->parent = 0;
+  p->name[0] = 0;
+  p->chan = 0;
+  p->killed = 0;
+  p->xstate = 0;
+  p->state = UNUSED;
+}
+
+// Create a user page table for a given process, with no user memory,
+// but with trampoline and trapframe pages.
+pagetable_t
+proc_pagetable(struct proc *p)
+{
+  pagetable_t pagetable;
+
+  // An empty page table.
+  pagetable = uvmcreate();
+  if(pagetable == 0)
+    return 0;
+
+  // map the trampoline code (for system call return)
+  // at the highest user virtual address.
+  // only the supervisor uses it, on the way
+  // to/from user space, so not PTE_U.
+  if(mappages(pagetable, TRAMPOLINE, PGSIZE,
+              (uint64)trampoline, PTE_R | PTE_X) < 0){
+    uvmfree(pagetable, 0);
+    return 0;
+  }
+
+  // map the trapframe page just below the trampoline page, for
+  // trampoline.S.
+  if(mappages(pagetable, TRAPFRAME, PGSIZE,
+              (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
+    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+    uvmfree(pagetable, 0);
+    return 0;
+  }
+
+  return pagetable;
+}
+
+// Free a process's page table, and free the
+// physical memory it refers to.
+void
+proc_freepagetable(pagetable_t pagetable, uint64 sz)
+{
+  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+  uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  uvmfree(pagetable, sz);
+}
+
+// a user program that calls exec("/init")
+// assembled from ../user/initcode.S
+// od -t xC ../user/initcode
+uchar initcode[] = {
+  0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02,
+  0x97, 0x05, 0x00, 0x00, 0x93, 0x85, 0x35, 0x02,
+  0x93, 0x08, 0x70, 0x00, 0x73, 0x00, 0x00, 0x00,
+  0x93, 0x08, 0x20, 0x00, 0x73, 0x00, 0x00, 0x00,
+  0xef, 0xf0, 0x9f, 0xff, 0x2f, 0x69, 0x6e, 0x69,
+  0x74, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00
+};
+
+// Set up first user process.
+void
+userinit(void)
+{
+  struct proc *p;
+
+  p = allocproc();
+  initproc = p;
+  
+  // allocate one user page and copy initcode's instructions
+  // and data into it.
+  uvmfirst(p->pagetable, initcode, sizeof(initcode));
+  p->sz = PGSIZE;
+
+  // prepare for the very first "return" from kernel to user.
+  p->trapframe->epc = 0;      // user program counter
+  p->trapframe->sp = PGSIZE;  // user stack pointer
+
+  safestrcpy(p->name, "initcode", sizeof(p->name));
+  p->cwd = namei("/");
+
+  p->state = RUNNABLE;
+
+  release(&p->lock);
+}
+
+// Grow or shrink user memory by n bytes.
+// Return 0 on success, -1 on failure.
+int
+growproc(int n)
+{
+  uint64 sz;
   struct proc *p = myproc();
 
-  begin_op();
+  sz = p->sz;
+  if(n > 0){
+    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+      return -1;
+    }
+  } else if(n < 0){
+    sz = uvmdealloc(p->pagetable, sz, sz + n);
+  }
+  p->sz = sz;
+  return 0;
+}
 
-  if((ip = namei(path)) == 0){
-    end_op();
+// Create a new process, copying the parent.
+// Sets up child kernel stack to return as if from fork() system call.
+int
+fork(void)
+{
+  int i, pid;
+  struct proc *np;
+  struct proc *p = myproc();
+
+  // Allocate process.
+  if((np = allocproc()) == 0){
     return -1;
   }
-  ilock(ip);
 
-  // Check ELF header
-  if(readi(ip, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf))
-    goto bad;
-
-  if(elf.magic != ELF_MAGIC)
-    goto bad;
-
-  if((pagetable = proc_pagetable(p)) == 0)
-    goto bad;
-
-  // Load program into memory.
-  for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
-    if(readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
-      goto bad;
-    if(ph.type != ELF_PROG_LOAD)
-      continue;
-    if(ph.memsz < ph.filesz)
-      goto bad;
-    if(ph.vaddr + ph.memsz < ph.vaddr)
-      goto bad;
-    if(ph.vaddr % PGSIZE != 0)
-      goto bad;
-    uint64 sz1;
-    if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz, flags2perm(ph.flags))) == 0)
-      goto bad;
-    sz = sz1;
-    if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
-      goto bad;
+  // Copy user memory from parent to child.
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
   }
-  iunlockput(ip);
+  np->sz = p->sz;
+
+  // copy saved user registers.
+  *(np->trapframe) = *(p->trapframe);
+
+  // Cause fork to return 0 in the child.
+  np->trapframe->a0 = 0;
+
+  // increment reference counts on open file descriptors.
+  for(i = 0; i < NOFILE; i++)
+    if(p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+
+  pid = np->pid;
+
+  release(&np->lock);
+
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return pid;
+}
+
+// Pass p's abandoned children to init.
+// Caller must hold wait_lock.
+void
+reparent(struct proc *p)
+{
+  struct proc *pp;
+
+  for(pp = proc; pp < &proc[NPROC]; pp++){
+    if(pp->parent == p){
+      pp->parent = initproc;
+      wakeup(initproc);
+    }
+  }
+}
+
+// Exit the current process.  Does not return.
+// An exited process remains in the zombie state
+// until its parent calls wait().
+void
+exit(int status)
+{
+  struct proc *p = myproc();
+
+  if(p == initproc)
+    panic("init exiting");
+
+  // Close all open files.
+  for(int fd = 0; fd < NOFILE; fd++){
+    if(p->ofile[fd]){
+      struct file *f = p->ofile[fd];
+      fileclose(f);
+      p->ofile[fd] = 0;
+    }
+  }
+
+  begin_op();
+  iput(p->cwd);
   end_op();
-  ip = 0;
+  p->cwd = 0;
 
-  p = myproc();
-  uint64 oldsz = p->sz;
+  acquire(&wait_lock);
 
-  // Allocate some pages at the next page boundary.
-  // Make the first inaccessible as a stack guard.
-  // Use the rest as the user stack.
-  sz = PGROUNDUP(sz);
-  uint64 sz1;
-  if((sz1 = uvmalloc(pagetable, sz, sz + (USERSTACK+1)*PGSIZE, PTE_W)) == 0)
-    goto bad;
-  sz = sz1;
-  uvmclear(pagetable, sz-(USERSTACK+1)*PGSIZE);
-  sp = sz;
-  stackbase = sp - USERSTACK*PGSIZE;
+  // Give any children to init.
+  reparent(p);
 
-  // Push argument strings, prepare rest of stack in ustack.
-  for(argc = 0; argv[argc]; argc++) {
-    if(argc >= MAXARG)
-      goto bad;
-    sp -= strlen(argv[argc]) + 1;
-    sp -= sp % 16; // riscv sp must be 16-byte aligned
-    if(sp < stackbase)
-      goto bad;
-    if(copyout(pagetable, sp, argv[argc], strlen(argv[argc]) + 1) < 0)
-      goto bad;
-    ustack[argc] = sp;
-  }
-  ustack[argc] = 0;
+  // Parent might be sleeping in wait().
+  wakeup(p->parent);
+  
+  acquire(&p->lock);
 
-  // push the array of argv[] pointers.
-  sp -= (argc+1) * sizeof(uint64);
-  sp -= sp % 16;
-  if(sp < stackbase)
-    goto bad;
-  if(copyout(pagetable, sp, (char *)ustack, (argc+1)*sizeof(uint64)) < 0)
-    goto bad;
+  p->xstate = status;
+  p->state = ZOMBIE;
 
-  // arguments to user main(argc, argv)
-  // argc is returned via the system call return
-  // value, which goes in a0.
-  p->trapframe->a1 = sp;
+  release(&wait_lock);
 
-  // Save program name for debugging.
-  for(last=s=path; *s; s++)
-    if(*s == '/')
-      last = s+1;
-  safestrcpy(p->name, last, sizeof(p->name));
+  // Jump into the scheduler, never to return.
+  sched();
+  panic("zombie exit");
+}
+
+// Wait for a child process to exit and return its pid.
+// Return -1 if this process has no children.
+int
+wait(uint64 addr)
+{
+  struct proc *pp;
+  int havekids, pid;
+  struct proc *p = myproc();
+
+  acquire(&wait_lock);
+
+  for(;;){
+    // Scan through table looking for exited children.
+    havekids = 0;
+    for(pp = proc; pp < &proc[NPROC]; pp++){
+      if(pp->parent == p){
+        // make sure the child isn't still in exit() or swtch().
+        acquire(&pp->lock);
+
+        havekids = 1;
+        if(pp->state == ZOMBIE){
+          // Found one.
+          pid = pp->pid;
+          if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
+                                  sizeof(pp->xstate)) < 0) {
+            release(&pp->lock);
+            release(&wait_lock);
+            return -1;
+          }
+          freeproc(pp);
+          release(&pp->lock);
+          release(&wait_lock);
+          return pid;
+        }
+        release(&pp->lock);
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havekids || killed(p)){
+      release(&wait_lock);
+      return -1;
+    }
     
-  // Commit to the user image.
-  oldpagetable = p->pagetable;
-  p->pagetable = pagetable;
-  p->sz = sz;
-  p->trapframe->epc = elf.entry;  // initial program counter = main
-  p->trapframe->sp = sp; // initial stack pointer
-  proc_freepagetable(oldpagetable, oldsz);
+    // Wait for a child to exit.
+    sleep(p, &wait_lock);  //DOC: wait-sleep
+  }
+}
 
-  return argc; // this ends up in a0, the first argument to main(argc, argv)
+// Per-CPU process scheduler.
+// Each CPU calls scheduler() after setting itself up.
+// Scheduler never returns.  It loops, doing:
+//  - choose a process to run.
+//  - swtch to start running that process.
+//  - eventually that process transfers control
+//    via swtch back to the scheduler.
+void
+scheduler(void)
+{
+  struct proc *p;
+  struct cpu *c = mycpu();
 
- bad:
-  if(pagetable)
-    proc_freepagetable(pagetable, sz);
-  if(ip){
-    iunlockput(ip);
-    end_op();
+  c->proc = 0;
+  for(;;){
+    // The most recent process to run may have had interrupts
+    // turned off; enable them to avoid a deadlock if all
+    // processes are waiting.
+    intr_on();
+
+    int found = 0;
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE) {
+        // Switch to chosen process.  It is the process's job
+        // to release its lock and then reacquire it
+        // before jumping back to us.
+        p->state = RUNNING;
+        c->proc = p;
+        swtch(&c->context, &p->context);
+
+        // Process is done running for now.
+        // It should have changed its p->state before coming back.
+        c->proc = 0;
+        found = 1;
+      }
+      release(&p->lock);
+    }
+    if(found == 0) {
+      // nothing to run; stop running on this core until an interrupt.
+      intr_on();
+      asm volatile("wfi");
+    }
+  }
+}
+
+// Switch to scheduler.  Must hold only p->lock
+// and have changed proc->state. Saves and restores
+// intena because intena is a property of this
+// kernel thread, not this CPU. It should
+// be proc->intena and proc->noff, but that would
+// break in the few places where a lock is held but
+// there's no process.
+void
+sched(void)
+{
+  int intena;
+  struct proc *p = myproc();
+
+  if(!holding(&p->lock))
+    panic("sched p->lock");
+  if(mycpu()->noff != 1)
+    panic("sched locks");
+  if(p->state == RUNNING)
+    panic("sched running");
+  if(intr_get())
+    panic("sched interruptible");
+
+  intena = mycpu()->intena;
+  swtch(&p->context, &mycpu()->context);
+  mycpu()->intena = intena;
+}
+
+// Give up the CPU for one scheduling round.
+void
+yield(void)
+{
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  p->state = RUNNABLE;
+  sched();
+  release(&p->lock);
+}
+
+// A fork child's very first scheduling by scheduler()
+// will swtch to forkret.
+void
+forkret(void)
+{
+  static int first = 1;
+
+  // Still holding p->lock from scheduler.
+  release(&myproc()->lock);
+
+  if (first) {
+    // File system initialization must be run in the context of a
+    // regular process (e.g., because it calls sleep), and thus cannot
+    // be run from main().
+    fsinit(ROOTDEV);
+
+    first = 0;
+    // ensure other cores see first=0.
+    __sync_synchronize();
+  }
+
+  usertrapret();
+}
+
+// Atomically release lock and sleep on chan.
+// Reacquires lock when awakened.
+void
+sleep(void *chan, struct spinlock *lk)
+{
+  struct proc *p = myproc();
+  
+  // Must acquire p->lock in order to
+  // change p->state and then call sched.
+  // Once we hold p->lock, we can be
+  // guaranteed that we won't miss any wakeup
+  // (wakeup locks p->lock),
+  // so it's okay to release lk.
+
+  acquire(&p->lock);  //DOC: sleeplock1
+  release(lk);
+
+  // Go to sleep.
+  p->chan = chan;
+  p->state = SLEEPING;
+
+  sched();
+
+  // Tidy up.
+  p->chan = 0;
+
+  // Reacquire original lock.
+  release(&p->lock);
+  acquire(lk);
+}
+
+// Wake up all processes sleeping on chan.
+// Must be called without any p->lock.
+void
+wakeup(void *chan)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    if(p != myproc()){
+      acquire(&p->lock);
+      if(p->state == SLEEPING && p->chan == chan) {
+        p->state = RUNNABLE;
+      }
+      release(&p->lock);
+    }
+  }
+}
+
+// Kill the process with the given pid.
+// The victim won't exit until it tries to return
+// to user space (see usertrap() in trap.c).
+int
+kill(int pid)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid){
+      p->killed = 1;
+      if(p->state == SLEEPING){
+        // Wake process from sleep().
+        p->state = RUNNABLE;
+      }
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
   }
   return -1;
 }
 
-// Load a program segment into pagetable at virtual address va.
-// va must be page-aligned
-// and the pages from va to va+sz must already be mapped.
-// Returns 0 on success, -1 on failure.
-static int
-loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset, uint sz)
+void
+setkilled(struct proc *p)
 {
-  uint i, n;
-  uint64 pa;
+  acquire(&p->lock);
+  p->killed = 1;
+  release(&p->lock);
+}
 
-  for(i = 0; i < sz; i += PGSIZE){
-    pa = walkaddr(pagetable, va + i);
-    if(pa == 0)
-      panic("loadseg: address should exist");
-    if(sz - i < PGSIZE)
-      n = sz - i;
+int
+killed(struct proc *p)
+{
+  int k;
+  
+  acquire(&p->lock);
+  k = p->killed;
+  release(&p->lock);
+  return k;
+}
+
+// Copy to either a user address, or kernel address,
+// depending on usr_dst.
+// Returns 0 on success, -1 on error.
+int
+either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
+{
+  struct proc *p = myproc();
+  if(user_dst){
+    return copyout(p->pagetable, dst, src, len);
+  } else {
+    memmove((char *)dst, src, len);
+    return 0;
+  }
+}
+
+// Copy from either a user address, or kernel address,
+// depending on usr_src.
+// Returns 0 on success, -1 on error.
+int
+either_copyin(void *dst, int user_src, uint64 src, uint64 len)
+{
+  struct proc *p = myproc();
+  if(user_src){
+    return copyin(p->pagetable, dst, src, len);
+  } else {
+    memmove(dst, (char*)src, len);
+    return 0;
+  }
+}
+
+// Print a process listing to console.  For debugging.
+// Runs when user types ^P on console.
+// No lock to avoid wedging a stuck machine further.
+void
+procdump(void)
+{
+  static char *states[] = {
+  [UNUSED]    "unused",
+  [USED]      "used",
+  [SLEEPING]  "sleep ",
+  [RUNNABLE]  "runble",
+  [RUNNING]   "run   ",
+  [ZOMBIE]    "zombie"
+  };
+  struct proc *p;
+  char *state;
+
+  printf("\n");
+  for(p = proc; p < &proc[NPROC]; p++){
+    if(p->state == UNUSED)
+      continue;
+    if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
+      state = states[p->state];
     else
-      n = PGSIZE;
-    if(readi(ip, 0, (uint64)pa, offset+i, n) != n)
+      state = "???";
+    printf("%d %s %s", p->pid, state, p->name);
+    printf("\n");
+  }
+}
+
+
+uint64
+kernel_sha256(void) {
+    // Hardcoded input string
+    char input[] = "kernel"; 
+    uint8 hash[32];          // Buffer for the SHA-256 output
+    SHA256_CTX ctx;          // SHA-256 context
+    char hex_output[65];     // Buffer for the hexadecimal hash string
+    int i;
+
+    // SHA-256 computation steps
+    sha256_init(&ctx);                            // Initialize SHA-256 context
+    sha256_update(&ctx, (uint8*)input, strlen(input));  // Process the input string
+    sha256_final(&ctx, hash);                     // Finalize the hash
+
+    // Convert hash to hexadecimal string
+    for (i = 0; i < 32; i++) {
+        byte_to_hex(hash[i], &hex_output[i * 2]);
+    }
+    hex_output[64] = '\0';  // Null-terminate the string
+
+    // Print the hash
+    printf("Input for Kernel Space =  %s\n", input);
+    printf("SHA-256 hash = %s\n", hex_output);
+
+    return 0;
+}
+
+#include "kernel/types.h"
+#include "kernel/syscall.h"
+#include "kernel/string.h"
+
+
+// adding sha256.h here gives conflicting types error
+
+
+// variables to store current hash
+static char boot_hash_hex_storage[65];
+static int boot_hash_is_ready = 0;
+
+#define ROTLEFT(a, b) ((a << b) | (a >> (32 - b)))
+#define ROTRIGHT(a, b) ((a >> b) | (a << (32 - b)))
+#define CH(x, y, z) ((x & y) ^ (~x & z))
+#define MAJ(x, y, z) ((x & y) ^ (x & z) ^ (y & z))
+#define EP0(x) (ROTRIGHT(x, 2) ^ ROTRIGHT(x, 13) ^ ROTRIGHT(x, 22))
+#define EP1(x) (ROTRIGHT(x, 6) ^ ROTRIGHT(x, 11) ^ (ROTRIGHT(x, 25)))
+#define SIG0(x) (ROTRIGHT(x, 7) ^ ROTRIGHT(x, 18) ^ (x >> 3))
+#define SIG1(x) (ROTRIGHT(x, 17) ^ ROTRIGHT(x, 19) ^ (x >> 10))
+
+static const uint32 k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+typedef struct {
+    uint8 data[64];
+    uint32 datalen;
+    uint64 bitlen;
+    uint32 state[8];
+} SHA256_CTX;
+
+void sha256_transform(SHA256_CTX *ctx, uint8 data[]) {
+    uint32 a, b, c, d, e, f, g, h, i, j, t1, t2, m[64];
+
+    for (i = 0, j = 0; i < 16; ++i, j += 4)
+        m[i] = (data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | (data[j + 3]);
+    for (; i < 64; ++i)
+        m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
+
+    a = ctx->state[0];
+    b = ctx->state[1];
+    c = ctx->state[2];
+    d = ctx->state[3];
+    e = ctx->state[4];
+    f = ctx->state[5];
+    g = ctx->state[6];
+    h = ctx->state[7];
+
+    for (i = 0; i < 64; ++i) {
+        t1 = h + EP1(e) + CH(e, f, g) + k[i] + m[i];
+        t2 = EP0(a) + MAJ(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    ctx->state[0] += a;
+    ctx->state[1] += b;
+    ctx->state[2] += c;
+    ctx->state[3] += d;
+    ctx->state[4] += e;
+    ctx->state[5] += f;
+    ctx->state[6] += g;
+    ctx->state[7] += h;
+}
+
+void sha256_init(SHA256_CTX *ctx) {
+    ctx->datalen = 0;
+    ctx->bitlen = 0;
+    ctx->state[0] = 0x6a09e667;
+    ctx->state[1] = 0xbb67ae85;
+    ctx->state[2] = 0x3c6ef372;
+    ctx->state[3] = 0xa54ff53a;
+    ctx->state[4] = 0x510e527f;
+    ctx->state[5] = 0x9b05688c;
+    ctx->state[6] = 0x1f83d9ab;
+    ctx->state[7] = 0x5be0cd19;
+}
+
+void sha256_update(SHA256_CTX *ctx, uint8 data[], uint len) {
+    for (uint i = 0; i < len; ++i) {
+        ctx->data[ctx->datalen] = data[i];
+        ctx->datalen++;
+        if (ctx->datalen == 64) {
+            sha256_transform(ctx, ctx->data);
+            ctx->bitlen += 512;
+            ctx->datalen = 0;
+        }
+    }
+}
+
+void sha256_final(SHA256_CTX *ctx, uint8 hash[]) {
+    uint32 i = ctx->datalen;
+
+    if (ctx->datalen < 56) {
+        ctx->data[i++] = 0x80;
+        while (i < 56)
+            ctx->data[i++] = 0x00;
+    } else {
+        ctx->data[i++] = 0x80;
+        while (i < 64)
+            ctx->data[i++] = 0x00;
+        sha256_transform(ctx, ctx->data);
+        memset(ctx->data, 0, 56);
+    }
+
+    ctx->bitlen += ctx->datalen * 8;
+    ctx->data[63] = ctx->bitlen;
+    ctx->data[62] = ctx->bitlen >> 8;
+    ctx->data[61] = ctx->bitlen >> 16;
+    ctx->data[60] = ctx->bitlen >> 24;
+    ctx->data[59] = ctx->bitlen >> 32;
+    ctx->data[58] = ctx->bitlen >> 40;
+    ctx->data[57] = ctx->bitlen >> 48;
+    ctx->data[56] = ctx->bitlen >> 56;
+    sha256_transform(ctx, ctx->data);
+
+    for (i = 0; i < 4; ++i) {
+        hash[i] = (ctx->state[0] >> (24 - i * 8)) & 0x000000ff;
+        hash[i + 4] = (ctx->state[1] >> (24 - i * 8)) & 0x000000ff;
+        hash[i + 8] = (ctx->state[2] >> (24 - i * 8)) & 0x000000ff;
+        hash[i + 12] = (ctx->state[3] >> (24 - i * 8)) & 0x000000ff;
+        hash[i + 16] = (ctx->state[4] >> (24 - i * 8)) & 0x000000ff;
+        hash[i + 20] = (ctx->state[5] >> (24 - i * 8)) & 0x000000ff;
+        hash[i + 24] = (ctx->state[6] >> (24 - i * 8)) & 0x000000ff;
+        hash[i + 28] = (ctx->state[7] >> (24 - i * 8)) & 0x000000ff;
+    }
+}
+
+void byte_to_hex(uint8 byte, char* hex_str) {
+    const char hex_chars[] = "0123456789abcdef";
+    hex_str[0] = hex_chars[(byte >> 4) & 0x0F];
+    hex_str[1] = hex_chars[byte & 0x0F];
+}
+
+
+
+void store_boot_hash(char *calculated_hash_hex) {
+    if (calculated_hash_hex != 0) {
+        // Use strncpy: Copies up to n characters. Does NOT guarantee null term
+        // if src is n chars or longer.
+        strncpy(boot_hash_hex_storage, calculated_hash_hex, sizeof(boot_hash_hex_storage) - 1); // Copy max 64 chars
+
+        // ** CRITICAL: Manually null-terminate the buffer **
+        // This ensures the string is terminated even if strncpy didn't add one.
+        boot_hash_hex_storage[sizeof(boot_hash_hex_storage) - 1] = '\0';
+
+        boot_hash_is_ready = 1; // Mark as ready
+    }
+}
+
+// --- Public function for the system call to retrieve the hash ---
+// Returns 0 on success, -1 if hash isn't ready or buffer too small.
+int retrieve_boot_hash(char *output_buffer, int buffer_size) {
+    if (!boot_hash_is_ready || output_buffer == 0) {
+        return -1; // Hash not ready or output buffer invalid
+    }
+    // Ensure the provided buffer is large enough for the hash string + null
+    // We need space for 64 hex chars + 1 null = 65 bytes.
+    if (buffer_size < sizeof(boot_hash_hex_storage)) {
+        return -1; // Buffer too small
+    }
+
+    // Use strncpy: Copies up to n characters. Does NOT guarantee null term.
+    strncpy(output_buffer, boot_hash_hex_storage, buffer_size - 1); // Copy max buffer_size-1 chars
+
+    // ** CRITICAL: Manually null-terminate the output buffer **
+    output_buffer[buffer_size - 1] = '\0';
+
+    return 0; // Success
+}
+// Sleeping locks mr miyagi 
+
+#include "types.h"
+#include "riscv.h"
+#include "defs.h"
+#include "param.h"
+#include "memlayout.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "sleeplock.h"
+
+void
+initsleeplock(struct sleeplock *lk, char *name)
+{
+  initlock(&lk->lk, "sleep lock");
+  lk->name = name;
+  lk->locked = 0;
+  lk->pid = 0;
+}
+
+void
+acquiresleep(struct sleeplock *lk)
+{
+  acquire(&lk->lk);
+  while (lk->locked) {
+    sleep(lk, &lk->lk);
+  }
+  lk->locked = 1;
+  lk->pid = myproc()->pid;
+  release(&lk->lk);
+}
+
+void
+releasesleep(struct sleeplock *lk)
+{
+  acquire(&lk->lk);
+  lk->locked = 0;
+  lk->pid = 0;
+  wakeup(lk);
+  release(&lk->lk);
+}
+
+int
+holdingsleep(struct sleeplock *lk)
+{
+  int r;
+  
+  acquire(&lk->lk);
+  r = lk->locked && (lk->pid == myproc()->pid);
+  release(&lk->lk);
+  return r;
+}
+// Mutual exclusion spin locks.
+
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "spinlock.h"
+#include "riscv.h"
+#include "proc.h"
+#include "defs.h"
+
+void
+initlock(struct spinlock *lk, char *name)
+{
+  lk->name = name;
+  lk->locked = 0;
+  lk->cpu = 0;
+}
+
+// Acquire the lock.
+// Loops (spins) until the lock is acquired.
+void
+acquire(struct spinlock *lk)
+{
+  push_off(); // disable interrupts to avoid deadlock.
+  if(holding(lk))
+    panic("acquire");
+
+  // On RISC-V, sync_lock_test_and_set turns into an atomic swap:
+  //   a5 = 1
+  //   s1 = &lk->locked
+  //   amoswap.w.aq a5, a5, (s1)
+  while(__sync_lock_test_and_set(&lk->locked, 1) != 0)
+    ;
+
+  // Tell the C compiler and the processor to not move loads or stores
+  // past this point, to ensure that the critical section's memory
+  // references happen strictly after the lock is acquired.
+  // On RISC-V, this emits a fence instruction.
+  __sync_synchronize();
+
+  // Record info about lock acquisition for holding() and debugging.
+  lk->cpu = mycpu();
+}
+
+// Release the lock.
+void
+release(struct spinlock *lk)
+{
+  if(!holding(lk))
+    panic("release");
+
+  lk->cpu = 0;
+
+  // Tell the C compiler and the CPU to not move loads or stores
+  // past this point, to ensure that all the stores in the critical
+  // section are visible to other CPUs before the lock is released,
+  // and that loads in the critical section occur strictly before
+  // the lock is released.
+  // On RISC-V, this emits a fence instruction.
+  __sync_synchronize();
+
+  // Release the lock, equivalent to lk->locked = 0.
+  // This code doesn't use a C assignment, since the C standard
+  // implies that an assignment might be implemented with
+  // multiple store instructions.
+  // On RISC-V, sync_lock_release turns into an atomic swap:
+  //   s1 = &lk->locked
+  //   amoswap.w zero, zero, (s1)
+  __sync_lock_release(&lk->locked);
+
+  pop_off();
+}
+
+// Check whether this cpu is holding the lock.
+// Interrupts must be off.
+int
+holding(struct spinlock *lk)
+{
+  int r;
+  r = (lk->locked && lk->cpu == mycpu());
+  return r;
+}
+
+// push_off/pop_off are like intr_off()/intr_on() except that they are matched:
+// it takes two pop_off()s to undo two push_off()s.  Also, if interrupts
+// are initially off, then push_off, pop_off leaves them off.
+
+void
+push_off(void)
+{
+  int old = intr_get();
+
+  intr_off();
+  if(mycpu()->noff == 0)
+    mycpu()->intena = old;
+  mycpu()->noff += 1;
+}
+
+void
+pop_off(void)
+{
+  struct cpu *c = mycpu();
+  if(intr_get())
+    panic("pop_off - interruptible");
+  if(c->noff < 1)
+    panic("pop_off");
+  c->noff -= 1;
+  if(c->noff == 0 && c->intena)
+    intr_on();
+}
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "defs.h"
+
+void main();
+void timerinit();
+
+// entry.S needs one stack per CPU.
+__attribute__ ((aligned (16))) char stack0[4096 * NCPU];
+
+// entry.S jumps here in machine mode on stack0.
+void
+start()
+{
+  // set M Previous Privilege mode to Supervisor, for mret.
+  unsigned long x = r_mstatus();
+  x &= ~MSTATUS_MPP_MASK;
+  x |= MSTATUS_MPP_S;
+  w_mstatus(x);
+
+  // set M Exception Program Counter to main, for mret.
+  // requires gcc -mcmodel=medany
+  w_mepc((uint64)main);
+
+  // disable paging for now.
+  w_satp(0);
+
+  // delegate all interrupts and exceptions to supervisor mode.
+  w_medeleg(0xffff);
+  w_mideleg(0xffff);
+  w_sie(r_sie() | SIE_SEIE | SIE_STIE | SIE_SSIE);
+
+  // configure Physical Memory Protection to give supervisor mode
+  // access to all of physical memory.
+  w_pmpaddr0(0x3fffffffffffffull);
+  w_pmpcfg0(0xf);
+
+  // ask for clock interrupts.
+  timerinit();
+
+  // keep each CPU's hartid in its tp register, for cpuid().
+  int id = r_mhartid();
+  w_tp(id);
+
+  // switch to supervisor mode and jump to main().
+  asm volatile("mret");
+}
+
+// ask each hart to generate timer interrupts.
+void
+timerinit()
+{
+  // enable supervisor-mode timer interrupts.
+  w_mie(r_mie() | MIE_STIE);
+  
+  // enable the sstc extension (i.e. stimecmp).
+//  w_menvcfg(r_menvcfg() | (1L << 63)); 
+  
+  // allow supervisor to use stimecmp and time.
+  w_mcounteren(r_mcounteren() | 2);
+  
+  // ask for the very first timer interrupt.
+ // w_stimecmp(r_time() + 1000000);
+}
+#include "types.h"
+
+void*
+memset(void *dst, int c, uint n)
+{
+  char *cdst = (char *) dst;
+  int i;
+  for(i = 0; i < n; i++){
+    cdst[i] = c;
+  }
+  return dst;
+}
+
+int
+memcmp(const void *v1, const void *v2, uint n)
+{
+  const uchar *s1, *s2;
+
+  s1 = v1;
+  s2 = v2;
+  while(n-- > 0){
+    if(*s1 != *s2)
+      return *s1 - *s2;
+    s1++, s2++;
+  }
+
+  return 0;
+}
+
+void*
+memmove(void *dst, const void *src, uint n)
+{
+  const char *s;
+  char *d;
+
+  if(n == 0)
+    return dst;
+  
+  s = src;
+  d = dst;
+  if(s < d && s + n > d){
+    s += n;
+    d += n;
+    while(n-- > 0)
+      *--d = *--s;
+  } else
+    while(n-- > 0)
+      *d++ = *s++;
+
+  return dst;
+}
+
+// memcpy exists to placate GCC.  Use memmove.
+void*
+memcpy(void *dst, const void *src, uint n)
+{
+  return memmove(dst, src, n);
+}
+
+int
+strncmp(const char *p, const char *q, uint n)
+{
+  while(n > 0 && *p && *p == *q)
+    n--, p++, q++;
+  if(n == 0)
+    return 0;
+  return (uchar)*p - (uchar)*q;
+}
+
+char*
+strncpy(char *s, const char *t, int n)
+{
+  char *os;
+
+  os = s;
+  while(n-- > 0 && (*s++ = *t++) != 0)
+    ;
+  while(n-- > 0)
+    *s++ = 0;
+  return os;
+}
+
+// Like strncpy but guaranteed to NUL-terminate.
+char*
+safestrcpy(char *s, const char *t, int n)
+{
+  char *os;
+
+  os = s;
+  if(n <= 0)
+    return os;
+  while(--n > 0 && (*s++ = *t++) != 0)
+    ;
+  *s = 0;
+  return os;
+}
+
+int
+strlen(const char *s)
+{
+  int n;
+
+  for(n = 0; s[n]; n++)
+    ;
+  return n;
+}
+
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "syscall.h"
+#include "defs.h"
+
+// Fetch the uint64 at addr from the current process.
+int
+fetchaddr(uint64 addr, uint64 *ip)
+{
+  struct proc *p = myproc();
+  if(addr >= p->sz || addr+sizeof(uint64) > p->sz) // both tests needed, in case of overflow
+    return -1;
+  if(copyin(p->pagetable, (char *)ip, addr, sizeof(*ip)) != 0)
+    return -1;
+  return 0;
+}
+
+// Fetch the nul-terminated string at addr from the current process.
+// Returns length of string, not including nul, or -1 for error.
+int
+fetchstr(uint64 addr, char *buf, int max)
+{
+  struct proc *p = myproc();
+  if(copyinstr(p->pagetable, buf, addr, max) < 0)
+    return -1;
+  return strlen(buf);
+}
+
+static uint64
+argraw(int n)
+{
+  struct proc *p = myproc();
+  switch (n) {
+  case 0:
+    return p->trapframe->a0;
+  case 1:
+    return p->trapframe->a1;
+  case 2:
+    return p->trapframe->a2;
+  case 3:
+    return p->trapframe->a3;
+  case 4:
+    return p->trapframe->a4;
+  case 5:
+    return p->trapframe->a5;
+  }
+  panic("argraw");
+  return -1;
+}
+
+// Fetch the nth 32-bit system call argument.
+void
+argint(int n, int *ip)
+{
+  *ip = argraw(n);
+}
+
+// Retrieve an argument as a pointer.
+// Doesn't check for legality, since
+// copyin/copyout will do that.
+void
+argaddr(int n, uint64 *ip)
+{
+  *ip = argraw(n);
+}
+
+// Fetch the nth word-sized system call argument as a null-terminated string.
+// Copies into buf, at most max.
+// Returns string length if OK (including nul), -1 if error.
+int
+argstr(int n, char *buf, int max)
+{
+  uint64 addr;
+  argaddr(n, &addr);
+  return fetchstr(addr, buf, max);
+}
+  // Prototypes for the functions that handle system calls.
+extern uint64 sys_fork(void);
+extern uint64 sys_exit(void);
+extern uint64 sys_wait(void);
+extern uint64 sys_pipe(void);
+extern uint64 sys_read(void);
+extern uint64 sys_kill(void);
+extern uint64 sys_exec(void);
+extern uint64 sys_fstat(void);
+extern uint64 sys_chdir(void);
+extern uint64 sys_dup(void);
+extern uint64 sys_getpid(void);
+extern uint64 sys_sbrk(void);
+extern uint64 sys_sleep(void);
+extern uint64 sys_uptime(void);
+extern uint64 sys_open(void);
+extern uint64 sys_write(void);
+extern uint64 sys_mknod(void);
+extern uint64 sys_unlink(void);
+extern uint64 sys_link(void);
+extern uint64 sys_mkdir(void);
+extern uint64 sys_close(void);
+extern uint64 sys_time(void);
+extern uint64 sys_getmem(void);
+extern uint64 sys_get_sha256(void);
+// An array mapping syscall numbers from syscall.h
+
+// to the function that handles the system call
+static uint64 (*syscalls[])(void) = {
+[SYS_fork]    sys_fork,
+[SYS_exit]    sys_exit,
+[SYS_wait]    sys_wait,
+[SYS_pipe]    sys_pipe,
+[SYS_read]    sys_read,
+[SYS_kill]    sys_kill,
+[SYS_exec]    sys_exec,
+[SYS_fstat]   sys_fstat,
+[SYS_chdir]   sys_chdir,
+[SYS_dup]     sys_dup,
+[SYS_getpid]  sys_getpid,
+[SYS_sbrk]    sys_sbrk,
+[SYS_sleep]   sys_sleep,
+[SYS_uptime]  sys_uptime,
+[SYS_open]    sys_open,
+[SYS_write]   sys_write,
+[SYS_mknod]   sys_mknod,
+[SYS_unlink]  sys_unlink,
+[SYS_link]    sys_link,
+[SYS_mkdir]   sys_mkdir,
+[SYS_close]   sys_close,
+[SYS_time]    sys_time,
+[SYS_getmem]  sys_getmem,
+[SYS_get_sha256] sys_get_sha256
+
+};
+//@Qamar == very imp function
+void
+syscall(void)
+{
+  int num;
+  struct proc *p = myproc();
+
+//the syscall number is stored in register a7, this line retrieves it
+  num = p->trapframe->a7;
+
+//this condition checks if it is valid, must be greater than 0 and less than 
+// the len of syscall array and that the syscall actually exists
+  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+    // Use num to lookup the system call function for num, call it,
+    // and store its return value in p->trapframe->a0
+    p->trapframe->a0 = syscalls[num]();
+  }
+
+// else handle the error
+ else {
+    printf("%d %s: unknown sys call %d\n",
+            p->pid, p->name, num);
+    p->trapframe->a0 = -1;
+  }
+}
+//
+// File-system system calls.
+// Mostly argument checking, since we don't trust
+// user code, and calls into file.c and fs.c.
+//
+
+#include "types.h"
+#include "riscv.h"
+#include "defs.h"
+#include "param.h"
+#include "stat.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "fcntl.h"
+
+// Fetch the nth word-sized system call argument as a file descriptor
+// and return both the descriptor and the corresponding struct file.
+static int
+argfd(int n, int *pfd, struct file **pf)
+{
+  int fd;
+  struct file *f;
+
+  argint(n, &fd);
+  if(fd < 0 || fd >= NOFILE || (f=myproc()->ofile[fd]) == 0)
+    return -1;
+  if(pfd)
+    *pfd = fd;
+  if(pf)
+    *pf = f;
+  return 0;
+}
+
+// Allocate a file descriptor for the given file.
+// Takes over file reference from caller on success.
+static int
+fdalloc(struct file *f)
+{
+  int fd;
+  struct proc *p = myproc();
+
+  for(fd = 0; fd < NOFILE; fd++){
+    if(p->ofile[fd] == 0){
+      p->ofile[fd] = f;
+      return fd;
+    }
+  }
+  return -1;
+}
+
+uint64
+sys_dup(void)
+{
+  struct file *f;
+  int fd;
+
+  if(argfd(0, 0, &f) < 0)
+    return -1;
+  if((fd=fdalloc(f)) < 0)
+    return -1;
+  filedup(f);
+  return fd;
+}
+
+uint64
+sys_read(void)
+{
+  struct file *f;
+  int n;
+  uint64 p;
+
+  argaddr(1, &p);
+  argint(2, &n);
+  if(argfd(0, 0, &f) < 0)
+    return -1;
+  return fileread(f, p, n);
+}
+
+uint64
+sys_write(void)
+{
+  struct file *f;
+  int n;
+  uint64 p;
+  
+  argaddr(1, &p);
+  argint(2, &n);
+  if(argfd(0, 0, &f) < 0)
+    return -1;
+
+  return filewrite(f, p, n);
+}
+
+uint64
+sys_close(void)
+{
+  int fd;
+  struct file *f;
+
+  if(argfd(0, &fd, &f) < 0)
+    return -1;
+  myproc()->ofile[fd] = 0;
+  fileclose(f);
+  return 0;
+}
+
+uint64
+sys_fstat(void)
+{
+  struct file *f;
+  uint64 st; // user pointer to struct stat
+
+  argaddr(1, &st);
+  if(argfd(0, 0, &f) < 0)
+    return -1;
+  return filestat(f, st);
+}
+
+// Create the path new as a link to the same inode as old.
+uint64
+sys_link(void)
+{
+  char name[DIRSIZ], new[MAXPATH], old[MAXPATH];
+  struct inode *dp, *ip;
+
+  if(argstr(0, old, MAXPATH) < 0 || argstr(1, new, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+  if((ip = namei(old)) == 0){
+    end_op();
+    return -1;
+  }
+
+  ilock(ip);
+  if(ip->type == T_DIR){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  ip->nlink++;
+  iupdate(ip);
+  iunlock(ip);
+
+  if((dp = nameiparent(new, name)) == 0)
+    goto bad;
+  ilock(dp);
+  if(dp->dev != ip->dev || dirlink(dp, name, ip->inum) < 0){
+    iunlockput(dp);
+    goto bad;
+  }
+  iunlockput(dp);
+  iput(ip);
+
+  end_op();
+
+  return 0;
+
+bad:
+  ilock(ip);
+  ip->nlink--;
+  iupdate(ip);
+  iunlockput(ip);
+  end_op();
+  return -1;
+}
+
+// Is the directory dp empty except for "." and ".." ?
+static int
+isdirempty(struct inode *dp)
+{
+  int off;
+  struct dirent de;
+
+  for(off=2*sizeof(de); off<dp->size; off+=sizeof(de)){
+    if(readi(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+      panic("isdirempty: readi");
+    if(de.inum != 0)
+      return 0;
+  }
+  return 1;
+}
+
+uint64
+sys_unlink(void)
+{
+  struct inode *ip, *dp;
+  struct dirent de;
+  char name[DIRSIZ], path[MAXPATH];
+  uint off;
+
+  if(argstr(0, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+  if((dp = nameiparent(path, name)) == 0){
+    end_op();
+    return -1;
+  }
+
+  ilock(dp);
+
+  // Cannot unlink "." or "..".
+  if(namecmp(name, ".") == 0 || namecmp(name, "..") == 0)
+    goto bad;
+
+  if((ip = dirlookup(dp, name, &off)) == 0)
+    goto bad;
+  ilock(ip);
+
+  if(ip->nlink < 1)
+    panic("unlink: nlink < 1");
+  if(ip->type == T_DIR && !isdirempty(ip)){
+    iunlockput(ip);
+    goto bad;
+  }
+
+  memset(&de, 0, sizeof(de));
+  if(writei(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+    panic("unlink: writei");
+  if(ip->type == T_DIR){
+    dp->nlink--;
+    iupdate(dp);
+  }
+  iunlockput(dp);
+
+  ip->nlink--;
+  iupdate(ip);
+  iunlockput(ip);
+
+  end_op();
+
+  return 0;
+
+bad:
+  iunlockput(dp);
+  end_op();
+  return -1;
+}
+
+static struct inode*
+create(char *path, short type, short major, short minor)
+{
+  struct inode *ip, *dp;
+  char name[DIRSIZ];
+
+  if((dp = nameiparent(path, name)) == 0)
+    return 0;
+
+  ilock(dp);
+
+  if((ip = dirlookup(dp, name, 0)) != 0){
+    iunlockput(dp);
+    ilock(ip);
+    if(type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
+      return ip;
+    iunlockput(ip);
+    return 0;
+  }
+
+  if((ip = ialloc(dp->dev, type)) == 0){
+    iunlockput(dp);
+    return 0;
+  }
+
+  ilock(ip);
+  ip->major = major;
+  ip->minor = minor;
+  ip->nlink = 1;
+  iupdate(ip);
+
+  if(type == T_DIR){  // Create . and .. entries.
+    // No ip->nlink++ for ".": avoid cyclic ref count.
+    if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
+      goto fail;
+  }
+
+  if(dirlink(dp, name, ip->inum) < 0)
+    goto fail;
+
+  if(type == T_DIR){
+    // now that success is guaranteed:
+    dp->nlink++;  // for ".."
+    iupdate(dp);
+  }
+
+  iunlockput(dp);
+
+  return ip;
+
+ fail:
+  // something went wrong. de-allocate ip.
+  ip->nlink = 0;
+  iupdate(ip);
+  iunlockput(ip);
+  iunlockput(dp);
+  return 0;
+}
+
+uint64
+sys_open(void)
+{
+  char path[MAXPATH];
+  int fd, omode;
+  struct file *f;
+  struct inode *ip;
+  int n;
+
+  argint(1, &omode);
+  if((n = argstr(0, path, MAXPATH)) < 0)
+    return -1;
+
+  begin_op();
+
+  if(omode & O_CREATE){
+    ip = create(path, T_FILE, 0, 0);
+    if(ip == 0){
+      end_op();
       return -1;
+    }
+  } else {
+    if((ip = namei(path)) == 0){
+      end_op();
+      return -1;
+    }
+    ilock(ip);
+    if(ip->type == T_DIR && omode != O_RDONLY){
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+  }
+
+  if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+    if(f)
+      fileclose(f);
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  if(ip->type == T_DEVICE){
+    f->type = FD_DEVICE;
+    f->major = ip->major;
+  } else {
+    f->type = FD_INODE;
+    f->off = 0;
+  }
+  f->ip = ip;
+  f->readable = !(omode & O_WRONLY);
+  f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+
+  if((omode & O_TRUNC) && ip->type == T_FILE){
+    itrunc(ip);
+  }
+
+  iunlock(ip);
+  end_op();
+
+  return fd;
+}
+
+uint64
+sys_mkdir(void)
+{
+  char path[MAXPATH];
+  struct inode *ip;
+
+  begin_op();
+  if(argstr(0, path, MAXPATH) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0){
+    end_op();
+    return -1;
+  }
+  iunlockput(ip);
+  end_op();
+  return 0;
+}
+
+uint64
+sys_mknod(void)
+{
+  struct inode *ip;
+  char path[MAXPATH];
+  int major, minor;
+
+  begin_op();
+  argint(1, &major);
+  argint(2, &minor);
+  if((argstr(0, path, MAXPATH)) < 0 ||
+     (ip = create(path, T_DEVICE, major, minor)) == 0){
+    end_op();
+    return -1;
+  }
+  iunlockput(ip);
+  end_op();
+  return 0;
+}
+
+uint64
+sys_chdir(void)
+{
+  char path[MAXPATH];
+  struct inode *ip;
+  struct proc *p = myproc();
+  
+  begin_op();
+  if(argstr(0, path, MAXPATH) < 0 || (ip = namei(path)) == 0){
+    end_op();
+    return -1;
+  }
+  ilock(ip);
+  if(ip->type != T_DIR){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  iunlock(ip);
+  iput(p->cwd);
+  end_op();
+  p->cwd = ip;
+  return 0;
+}
+
+uint64
+sys_exec(void)
+{
+  char path[MAXPATH], *argv[MAXARG];
+  int i;
+  uint64 uargv, uarg;
+
+  argaddr(1, &uargv);
+  if(argstr(0, path, MAXPATH) < 0) {
+    return -1;
+  }
+  memset(argv, 0, sizeof(argv));
+  for(i=0;; i++){
+    if(i >= NELEM(argv)){
+      goto bad;
+    }
+    if(fetchaddr(uargv+sizeof(uint64)*i, (uint64*)&uarg) < 0){
+      goto bad;
+    }
+    if(uarg == 0){
+      argv[i] = 0;
+      break;
+    }
+    argv[i] = kalloc();
+    if(argv[i] == 0)
+      goto bad;
+    if(fetchstr(uarg, argv[i], PGSIZE) < 0)
+      goto bad;
+  }
+
+  int ret = exec(path, argv);
+
+  for(i = 0; i < NELEM(argv) && argv[i] != 0; i++)
+    kfree(argv[i]);
+
+  return ret;
+
+ bad:
+  for(i = 0; i < NELEM(argv) && argv[i] != 0; i++)
+    kfree(argv[i]);
+  return -1;
+}
+
+uint64
+sys_pipe(void)
+{
+  uint64 fdarray; // user pointer to array of two integers
+  struct file *rf, *wf;
+  int fd0, fd1;
+  struct proc *p = myproc();
+
+  argaddr(0, &fdarray);
+  if(pipealloc(&rf, &wf) < 0)
+    return -1;
+  fd0 = -1;
+  if((fd0 = fdalloc(rf)) < 0 || (fd1 = fdalloc(wf)) < 0){
+    if(fd0 >= 0)
+      p->ofile[fd0] = 0;
+    fileclose(rf);
+    fileclose(wf);
+    return -1;
+  }
+  if(copyout(p->pagetable, fdarray, (char*)&fd0, sizeof(fd0)) < 0 ||
+     copyout(p->pagetable, fdarray+sizeof(fd0), (char *)&fd1, sizeof(fd1)) < 0){
+    p->ofile[fd0] = 0;
+    p->ofile[fd1] = 0;
+    fileclose(rf);
+    fileclose(wf);
+    return -1;
+  }
+  return 0;
+}
+#include "types.h"
+#include "riscv.h"
+#include "defs.h"
+#include "param.h"
+#include "memlayout.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "sha256.h"
+
+
+uint64
+sys_exit(void)
+{
+  int n;
+  argint(0, &n);
+  exit(n);
+  return 0;  // not reached
+}
+
+uint64
+sys_getpid(void)
+{
+  return myproc()->pid;
+}
+
+uint64
+sys_fork(void)
+{
+  return fork();
+}
+
+uint64
+sys_wait(void)
+{
+  uint64 p;
+  argaddr(0, &p);
+  return wait(p);
+}
+
+uint64
+sys_sbrk(void)
+{
+  uint64 addr;
+  int n;
+
+  argint(0, &n);
+  addr = myproc()->sz;
+  if(growproc(n) < 0)
+    return -1;
+  return addr;
+}
+
+uint64
+sys_sleep(void)
+{
+  int n;
+  uint ticks0;
+
+  argint(0, &n);
+  if(n < 0)
+    n = 0;
+  acquire(&tickslock);
+  ticks0 = ticks;
+  while(ticks - ticks0 < n){
+    if(killed(myproc())){
+      release(&tickslock);
+      return -1;
+    }
+    sleep(&ticks, &tickslock);
+  }
+  release(&tickslock);
+  return 0;
+}
+
+uint64
+sys_kill(void)
+{
+  int pid;
+
+  argint(0, &pid);
+  return kill(pid);
+}
+
+// return how many clock tick interrupts have occurred
+// since start.
+
+extern struct spinlock tickslock;
+extern uint ticks;
+
+uint64
+sys_uptime(void)
+{
+  uint xticks;
+
+  acquire(&tickslock);
+  xticks = ticks;
+  release(&tickslock);
+
+  return xticks;
+}
+
+uint64
+sys_time(void) {
+uint64 current_time = r_time();  // Call r_time to get the current timer value
+    return current_time; 
+
+
+}
+// In sysproc.c
+uint64
+sys_getmem(void) {
+  char kernel_temp_buffer[65];
+
+  // Get the boot hash
+  if (retrieve_boot_hash(kernel_temp_buffer, sizeof(kernel_temp_buffer)) < 0) {
+    printf("sys_getmem: Hash not ready.\n");
+    return -1;
+  }
+
+  // Fixed location in user process to copy to (user buffer must exist!)
+  // Or better: use trapframe->a0 (holds the pointer passed by user code)
+  uint64 user_dst = myproc()->trapframe->a0;
+
+  // Copy to user space
+  if (copyout(myproc()->pagetable, user_dst, kernel_temp_buffer, sizeof(kernel_temp_buffer)) < 0) {
+    printf("sys_getmem: copyout failed.\n");
+    return -1;
+  }
+
+  return 0;
+}
+
+
+uint64
+sys_get_sha256(void) {
+    char input[100];  // Buffer to store input from user program
+    uint8 hash[32];
+    SHA256_CTX ctx;
+    char hex_output[65];
+    int i;
+
+    // Use argstr to retrieve the string argument
+    if (argstr(0, input, sizeof(input)) < 0) {
+        printf("Failed to retrieve input\n");
+        return -1; // Error code if argument retrieval fails
+    }
+
+    // SHA-256 computation steps
+    sha256_init(&ctx);
+    sha256_update(&ctx, (uint8*)input, strlen(input));
+    sha256_final(&ctx, hash);
+
+    for (i = 0; i < 32; i++) {
+        byte_to_hex(hash[i], &hex_output[i * 2]);
+    }
+    hex_output[64] = '\0'; // to terminate the null string
+
+    printf("SHA-256 hash: %s\n", hex_output);
+
+    return 0;
+}
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "defs.h"
+
+struct spinlock tickslock;
+uint ticks;
+
+extern char trampoline[], uservec[], userret[];
+
+// in kernelvec.S, calls kerneltrap().
+void kernelvec();
+
+extern int devintr();
+
+void
+trapinit(void)
+{
+  initlock(&tickslock, "time");ticks++;
+}
+
+// set up to take exceptions and traps while in the kernel.
+void
+trapinithart(void)
+{
+  w_stvec((uint64)kernelvec);
+}
+
+//
+// handle an interrupt, exception, or system call from user space.
+// called from trampoline.S
+//
+void
+usertrap(void)
+{
+  int which_dev = 0;
+
+  if((r_sstatus() & SSTATUS_SPP) != 0)
+    panic("usertrap: not from user mode");
+
+  // send interrupts and exceptions to kerneltrap(),
+  // since we're now in the kernel.
+  w_stvec((uint64)kernelvec);
+
+  struct proc *p = myproc();
+  
+  // save user program counter.
+  p->trapframe->epc = r_sepc();
+if(r_scause() == 8){
+    // system call
+
+    if(killed(p))
+      exit(-1);
+
+    // sepc points to the ecall instruction,
+    // but we want to return to the next instruction.
+    p->trapframe->epc += 4;
+
+    // an interrupt will change sepc, scause, and sstatus,
+    // so enable only now that we're done with those registers.
+    intr_on();
+
+   syscall();
+  }
+  else if((which_dev = devintr()) != 0){
+    // ok
+  } else {
+    printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+    printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+    setkilled(p);
+  }
+
+  if(killed(p))
+    exit(-1);
+
+  // give up the CPU if this is a timer interrupt.
+  if(which_dev == 2)
+    yield();
+
+  usertrapret();
+}
+
+//
+// return to user space
+//
+void
+usertrapret(void)
+{
+  struct proc *p = myproc();
+
+  // we're about to switch the destination of traps from
+  // kerneltrap() to usertrap(), so turn off interrupts until
+  // we're back in user space, where usertrap() is correct.
+  intr_off();
+
+  // send syscalls, interrupts, and exceptions to uservec in trampoline.S
+  uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
+  w_stvec(trampoline_uservec);
+
+  // set up trapframe values that uservec will need when
+  // the process next traps into the kernel.
+  p->trapframe->kernel_satp = r_satp();         // kernel page table
+  p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
+  p->trapframe->kernel_trap = (uint64)usertrap;
+  p->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
+
+  // set up the registers that trampoline.S's sret will use
+  // to get to user space.
+  
+  // set S Previous Privilege mode to User.
+  unsigned long x = r_sstatus();
+  x &= ~SSTATUS_SPP; // clear SPP to 0 for user mode
+  x |= SSTATUS_SPIE; // enable interrupts in user mode
+  w_sstatus(x);
+
+  // set S Exception Program Counter to the saved user pc.
+  w_sepc(p->trapframe->epc);
+
+  // tell trampoline.S the user page table to switch to.
+  uint64 satp = MAKE_SATP(p->pagetable);
+
+  // jump to userret in trampoline.S at the top of memory, which 
+  // switches to the user page table, restores user registers,
+  // and switches to user mode with sret.
+  uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
+  ((void (*)(uint64))trampoline_userret)(satp);
+}
+
+// interrupts and exceptions from kernel code go here via kernelvec,
+// on whatever the current kernel stack is.
+void 
+kerneltrap()
+{
+  int which_dev = 0;
+  uint64 sepc = r_sepc();
+  uint64 sstatus = r_sstatus();
+  uint64 scause = r_scause();
+  
+  if((sstatus & SSTATUS_SPP) == 0)
+    panic("kerneltrap: not from supervisor mode");
+  if(intr_get() != 0)
+    panic("kerneltrap: interrupts enabled");
+
+  if((which_dev = devintr()) == 0){
+    // interrupt or trap from an unknown source
+    printf("scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(), r_stval());
+    panic("kerneltrap");
+  }
+
+  // give up the CPU if this is a timer interrupt.
+  if(which_dev == 2 && myproc() != 0)
+    yield();
+
+  // the yield() may have caused some traps to occur,
+  // so restore trap registers for use by kernelvec.S's sepc instruction.
+  w_sepc(sepc);
+  w_sstatus(sstatus);
+}
+
+void
+clockintr()
+{
+ while (1) {
+    acquire(&tickslock);
+    ticks++;
+    wakeup(&ticks);  // Wake up any processes waiting on ticks
+    release(&tickslock);
+    
+    // Introduce a delay to simulate the passage of time (e.g., 100ms)
+    for (volatile int i = 0; i < 1000000; i++) {
+      // Busy-wait loop to add a delay
+    }
+  
+
+ // if(cpuid() == 0){
+   // acquire(&tickslock);
+   // ticks++;
+   // wakeup(&ticks);
+   // release(&tickslock);
+  }
+
+  // ask for the next timer interrupt. this also clears
+  // the interrupt request. 1000000 is about a tenth
+  // of a second.
+//  w_stimecmp(r_time() + 1000000);
+}
+
+// check if it's an external interrupt or software interrupt,
+// and handle it.
+// returns 2 if timer interrupt,
+// 1 if other device,
+// 0 if not recognized.
+int
+devintr()
+{
+  uint64 scause = r_scause();
+
+  if(scause == 0x8000000000000009L){
+    // this is a supervisor external interrupt, via PLIC.
+
+    // irq indicates which device interrupted.
+    int irq = plic_claim();
+
+    if(irq == UART0_IRQ){
+      uartintr();
+    } else if(irq == VIRTIO0_IRQ){
+      virtio_disk_intr();
+    } else if(irq){
+      printf("unexpected interrupt irq=%d\n", irq);
+    }
+
+    // the PLIC allows each device to raise at most one
+    // interrupt at a time; tell the PLIC the device is
+    // now allowed to interrupt again.
+    if(irq)
+      plic_complete(irq);
+
+    return 1;
+  } else if(scause == 0x8000000000000005L){
+    // timer interrupt.
+    clockintr();
+    return 2;
+  } else {
+    return 0;
+  }
+}
+
+//
+// low-level driver routines for 16550a UART.
+//
+
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "defs.h"
+
+// the UART control registers are memory-mapped
+// at address UART0. this macro returns the
+// address of one of the registers.
+#define Reg(reg) ((volatile unsigned char *)(UART0 + (reg)))
+
+// the UART control registers.
+// some have different meanings for
+// read vs write.
+// see http://byterunner.com/16550.html
+#define RHR 0                 // receive holding register (for input bytes)
+#define THR 0                 // transmit holding register (for output bytes)
+#define IER 1                 // interrupt enable register
+#define IER_RX_ENABLE (1<<0)
+#define IER_TX_ENABLE (1<<1)
+#define FCR 2                 // FIFO control register
+#define FCR_FIFO_ENABLE (1<<0)
+#define FCR_FIFO_CLEAR (3<<1) // clear the content of the two FIFOs
+#define ISR 2                 // interrupt status register
+#define LCR 3                 // line control register
+#define LCR_EIGHT_BITS (3<<0)
+#define LCR_BAUD_LATCH (1<<7) // special mode to set baud rate
+#define LSR 5                 // line status register
+#define LSR_RX_READY (1<<0)   // input is waiting to be read from RHR
+#define LSR_TX_IDLE (1<<5)    // THR can accept another character to send
+
+#define ReadReg(reg) (*(Reg(reg)))
+#define WriteReg(reg, v) (*(Reg(reg)) = (v))
+
+// the transmit output buffer.
+struct spinlock uart_tx_lock;
+#define UART_TX_BUF_SIZE 32
+char uart_tx_buf[UART_TX_BUF_SIZE];
+uint64 uart_tx_w; // write next to uart_tx_buf[uart_tx_w % UART_TX_BUF_SIZE]
+uint64 uart_tx_r; // read next from uart_tx_buf[uart_tx_r % UART_TX_BUF_SIZE]
+
+extern volatile int panicked; // from printf.c
+
+void uartstart();
+
+void
+uartinit(void)
+{
+  // disable interrupts.
+  WriteReg(IER, 0x00);
+
+  // special mode to set baud rate.
+  WriteReg(LCR, LCR_BAUD_LATCH);
+
+  // LSB for baud rate of 38.4K.
+  WriteReg(0, 0x03);
+
+  // MSB for baud rate of 38.4K.
+  WriteReg(1, 0x00);
+
+  // leave set-baud mode,
+  // and set word length to 8 bits, no parity.
+  WriteReg(LCR, LCR_EIGHT_BITS);
+
+  // reset and enable FIFOs.
+  WriteReg(FCR, FCR_FIFO_ENABLE | FCR_FIFO_CLEAR);
+
+  // enable transmit and receive interrupts.
+  WriteReg(IER, IER_TX_ENABLE | IER_RX_ENABLE);
+
+  initlock(&uart_tx_lock, "uart");
+}
+
+// add a character to the output buffer and tell the
+// UART to start sending if it isn't already.
+// blocks if the output buffer is full.
+// because it may block, it can't be called
+// from interrupts; it's only suitable for use
+// by write().
+void
+uartputc(int c)
+{
+  acquire(&uart_tx_lock);
+
+  if(panicked){
+    for(;;)
+      ;
+  }
+  while(uart_tx_w == uart_tx_r + UART_TX_BUF_SIZE){
+    // buffer is full.
+    // wait for uartstart() to open up space in the buffer.
+    sleep(&uart_tx_r, &uart_tx_lock);
+  }
+  uart_tx_buf[uart_tx_w % UART_TX_BUF_SIZE] = c;
+  uart_tx_w += 1;
+  uartstart();
+  release(&uart_tx_lock);
+}
+
+
+// alternate version of uartputc() that doesn't 
+// use interrupts, for use by kernel printf() and
+// to echo characters. it spins waiting for the uart's
+// output register to be empty.
+void
+uartputc_sync(int c)
+{
+  push_off();
+
+  if(panicked){
+    for(;;)
+      ;
+  }
+
+  // wait for Transmit Holding Empty to be set in LSR.
+  while((ReadReg(LSR) & LSR_TX_IDLE) == 0)
+    ;
+  WriteReg(THR, c);
+
+  pop_off();
+}
+
+// if the UART is idle, and a character is waiting
+// in the transmit buffer, send it.
+// caller must hold uart_tx_lock.
+// called from both the top- and bottom-half.
+void
+uartstart()
+{
+  while(1){
+    if(uart_tx_w == uart_tx_r){
+      // transmit buffer is empty.
+      ReadReg(ISR);
+      return;
+    }
+    
+    if((ReadReg(LSR) & LSR_TX_IDLE) == 0){
+      // the UART transmit holding register is full,
+      // so we cannot give it another byte.
+      // it will interrupt when it's ready for a new byte.
+      return;
+    }
+    
+    int c = uart_tx_buf[uart_tx_r % UART_TX_BUF_SIZE];
+    uart_tx_r += 1;
+    
+    // maybe uartputc() is waiting for space in the buffer.
+    wakeup(&uart_tx_r);
+    
+    WriteReg(THR, c);
+  }
+}
+
+// read one input character from the UART.
+// return -1 if none is waiting.
+int
+uartgetc(void)
+{
+  if(ReadReg(LSR) & 0x01){
+    // input data is ready.
+    return ReadReg(RHR);
+  } else {
+    return -1;
+  }
+}
+
+// handle a uart interrupt, raised because input has
+// arrived, or the uart is ready for more output, or
+// both. called from devintr().
+void
+uartintr(void)
+{
+  // read and process incoming characters.
+  while(1){
+    int c = uartgetc();
+    if(c == -1)
+      break;
+    consoleintr(c);
+  }
+
+  // send buffered characters.
+  acquire(&uart_tx_lock);
+  uartstart();
+  release(&uart_tx_lock);
+}
+//
+// driver for qemu's virtio disk device.
+// uses qemu's mmio interface to virtio.
+//
+// qemu ... -drive file=fs.img,if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+//
+
+#include "types.h"
+#include "riscv.h"
+#include "defs.h"
+#include "param.h"
+#include "memlayout.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "buf.h"
+#include "virtio.h"
+
+// the address of virtio mmio register r.
+#define R(r) ((volatile uint32 *)(VIRTIO0 + (r)))
+
+static struct disk {
+  // a set (not a ring) of DMA descriptors, with which the
+  // driver tells the device where to read and write individual
+  // disk operations. there are NUM descriptors.
+  // most commands consist of a "chain" (a linked list) of a couple of
+  // these descriptors.
+  struct virtq_desc *desc;
+
+  // a ring in which the driver writes descriptor numbers
+  // that the driver would like the device to process.  it only
+  // includes the head descriptor of each chain. the ring has
+  // NUM elements.
+  struct virtq_avail *avail;
+
+  // a ring in which the device writes descriptor numbers that
+  // the device has finished processing (just the head of each chain).
+  // there are NUM used ring entries.
+  struct virtq_used *used;
+
+  // our own book-keeping.
+  char free[NUM];  // is a descriptor free?
+  uint16 used_idx; // we've looked this far in used[2..NUM].
+
+  // track info about in-flight operations,
+  // for use when completion interrupt arrives.
+  // indexed by first descriptor index of chain.
+  struct {
+    struct buf *b;
+    char status;
+  } info[NUM];
+
+  // disk command headers.
+  // one-for-one with descriptors, for convenience.
+  struct virtio_blk_req ops[NUM];
+  
+  struct spinlock vdisk_lock;
+  
+} disk;
+
+void
+virtio_disk_init(void)
+{
+  uint32 status = 0;
+
+  initlock(&disk.vdisk_lock, "virtio_disk");
+
+  if(*R(VIRTIO_MMIO_MAGIC_VALUE) != 0x74726976 ||
+     *R(VIRTIO_MMIO_VERSION) != 2 ||
+     *R(VIRTIO_MMIO_DEVICE_ID) != 2 ||
+     *R(VIRTIO_MMIO_VENDOR_ID) != 0x554d4551){
+    panic("could not find virtio disk");
   }
   
+  // reset device
+  *R(VIRTIO_MMIO_STATUS) = status;
+
+  // set ACKNOWLEDGE status bit
+  status |= VIRTIO_CONFIG_S_ACKNOWLEDGE;
+  *R(VIRTIO_MMIO_STATUS) = status;
+
+  // set DRIVER status bit
+  status |= VIRTIO_CONFIG_S_DRIVER;
+  *R(VIRTIO_MMIO_STATUS) = status;
+
+  // negotiate features
+  uint64 features = *R(VIRTIO_MMIO_DEVICE_FEATURES);
+  features &= ~(1 << VIRTIO_BLK_F_RO);
+  features &= ~(1 << VIRTIO_BLK_F_SCSI);
+  features &= ~(1 << VIRTIO_BLK_F_CONFIG_WCE);
+  features &= ~(1 << VIRTIO_BLK_F_MQ);
+  features &= ~(1 << VIRTIO_F_ANY_LAYOUT);
+  features &= ~(1 << VIRTIO_RING_F_EVENT_IDX);
+  features &= ~(1 << VIRTIO_RING_F_INDIRECT_DESC);
+  *R(VIRTIO_MMIO_DRIVER_FEATURES) = features;
+
+  // tell device that feature negotiation is complete.
+  status |= VIRTIO_CONFIG_S_FEATURES_OK;
+  *R(VIRTIO_MMIO_STATUS) = status;
+
+  // re-read status to ensure FEATURES_OK is set.
+  status = *R(VIRTIO_MMIO_STATUS);
+  if(!(status & VIRTIO_CONFIG_S_FEATURES_OK))
+    panic("virtio disk FEATURES_OK unset");
+
+  // initialize queue 0.
+  *R(VIRTIO_MMIO_QUEUE_SEL) = 0;
+
+  // ensure queue 0 is not in use.
+  if(*R(VIRTIO_MMIO_QUEUE_READY))
+    panic("virtio disk should not be ready");
+
+  // check maximum queue size.
+  uint32 max = *R(VIRTIO_MMIO_QUEUE_NUM_MAX);
+  if(max == 0)
+    panic("virtio disk has no queue 0");
+  if(max < NUM)
+    panic("virtio disk max queue too short");
+
+  // allocate and zero queue memory.
+  disk.desc = kalloc();
+  disk.avail = kalloc();
+  disk.used = kalloc();
+  if(!disk.desc || !disk.avail || !disk.used)
+    panic("virtio disk kalloc");
+  memset(disk.desc, 0, PGSIZE);
+  memset(disk.avail, 0, PGSIZE);
+  memset(disk.used, 0, PGSIZE);
+
+  // set queue size.
+  *R(VIRTIO_MMIO_QUEUE_NUM) = NUM;
+
+  // write physical addresses.
+  *R(VIRTIO_MMIO_QUEUE_DESC_LOW) = (uint64)disk.desc;
+  *R(VIRTIO_MMIO_QUEUE_DESC_HIGH) = (uint64)disk.desc >> 32;
+  *R(VIRTIO_MMIO_DRIVER_DESC_LOW) = (uint64)disk.avail;
+  *R(VIRTIO_MMIO_DRIVER_DESC_HIGH) = (uint64)disk.avail >> 32;
+  *R(VIRTIO_MMIO_DEVICE_DESC_LOW) = (uint64)disk.used;
+  *R(VIRTIO_MMIO_DEVICE_DESC_HIGH) = (uint64)disk.used >> 32;
+
+  // queue is ready.
+  *R(VIRTIO_MMIO_QUEUE_READY) = 0x1;
+
+  // all NUM descriptors start out unused.
+  for(int i = 0; i < NUM; i++)
+    disk.free[i] = 1;
+
+  // tell device we're completely ready.
+  status |= VIRTIO_CONFIG_S_DRIVER_OK;
+  *R(VIRTIO_MMIO_STATUS) = status;
+
+  // plic.c and trap.c arrange for interrupts from VIRTIO0_IRQ.
+}
+
+// find a free descriptor, mark it non-free, return its index.
+static int
+alloc_desc()
+{
+  for(int i = 0; i < NUM; i++){
+    if(disk.free[i]){
+      disk.free[i] = 0;
+      return i;
+    }
+  }
+  return -1;
+}
+
+// mark a descriptor as free.
+static void
+free_desc(int i)
+{
+  if(i >= NUM)
+    panic("free_desc 1");
+  if(disk.free[i])
+    panic("free_desc 2");
+  disk.desc[i].addr = 0;
+  disk.desc[i].len = 0;
+  disk.desc[i].flags = 0;
+  disk.desc[i].next = 0;
+  disk.free[i] = 1;
+  wakeup(&disk.free[0]);
+}
+
+// free a chain of descriptors.
+static void
+free_chain(int i)
+{
+  while(1){
+    int flag = disk.desc[i].flags;
+    int nxt = disk.desc[i].next;
+    free_desc(i);
+    if(flag & VRING_DESC_F_NEXT)
+      i = nxt;
+    else
+      break;
+  }
+}
+
+// allocate three descriptors (they need not be contiguous).
+// disk transfers always use three descriptors.
+static int
+alloc3_desc(int *idx)
+{
+  for(int i = 0; i < 3; i++){
+    idx[i] = alloc_desc();
+    if(idx[i] < 0){
+      for(int j = 0; j < i; j++)
+        free_desc(idx[j]);
+      return -1;
+    }
+  }
   return 0;
+}
+
+void
+virtio_disk_rw(struct buf *b, int write)
+{
+  uint64 sector = b->blockno * (BSIZE / 512);
+
+  acquire(&disk.vdisk_lock);
+
+  // the spec's Section 5.2 says that legacy block operations use
+  // three descriptors: one for type/reserved/sector, one for the
+  // data, one for a 1-byte status result.
+
+  // allocate the three descriptors.
+  int idx[3];
+  while(1){
+    if(alloc3_desc(idx) == 0) {
+      break;
+    }
+    sleep(&disk.free[0], &disk.vdisk_lock);
+  }
+
+  // format the three descriptors.
+  // qemu's virtio-blk.c reads them.
+
+  struct virtio_blk_req *buf0 = &disk.ops[idx[0]];
+
+  if(write)
+    buf0->type = VIRTIO_BLK_T_OUT; // write the disk
+  else
+    buf0->type = VIRTIO_BLK_T_IN; // read the disk
+  buf0->reserved = 0;
+  buf0->sector = sector;
+
+  disk.desc[idx[0]].addr = (uint64) buf0;
+  disk.desc[idx[0]].len = sizeof(struct virtio_blk_req);
+  disk.desc[idx[0]].flags = VRING_DESC_F_NEXT;
+  disk.desc[idx[0]].next = idx[1];
+
+  disk.desc[idx[1]].addr = (uint64) b->data;
+  disk.desc[idx[1]].len = BSIZE;
+  if(write)
+    disk.desc[idx[1]].flags = 0; // device reads b->data
+  else
+    disk.desc[idx[1]].flags = VRING_DESC_F_WRITE; // device writes b->data
+  disk.desc[idx[1]].flags |= VRING_DESC_F_NEXT;
+  disk.desc[idx[1]].next = idx[2];
+
+  disk.info[idx[0]].status = 0xff; // device writes 0 on success
+  disk.desc[idx[2]].addr = (uint64) &disk.info[idx[0]].status;
+  disk.desc[idx[2]].len = 1;
+  disk.desc[idx[2]].flags = VRING_DESC_F_WRITE; // device writes the status
+  disk.desc[idx[2]].next = 0;
+
+  // record struct buf for virtio_disk_intr().
+  b->disk = 1;
+  disk.info[idx[0]].b = b;
+
+  // tell the device the first index in our chain of descriptors.
+  disk.avail->ring[disk.avail->idx % NUM] = idx[0];
+
+  __sync_synchronize();
+
+  // tell the device another avail ring entry is available.
+  disk.avail->idx += 1; // not % NUM ...
+
+  __sync_synchronize();
+
+  *R(VIRTIO_MMIO_QUEUE_NOTIFY) = 0; // value is queue number
+
+  // Wait for virtio_disk_intr() to say request has finished.
+  while(b->disk == 1) {
+    sleep(b, &disk.vdisk_lock);
+  }
+
+  disk.info[idx[0]].b = 0;
+  free_chain(idx[0]);
+
+  release(&disk.vdisk_lock);
+}
+
+void
+virtio_disk_intr()
+{
+  acquire(&disk.vdisk_lock);
+
+  // the device won't raise another interrupt until we tell it
+  // we've seen this interrupt, which the following line does.
+  // this may race with the device writing new entries to
+  // the "used" ring, in which case we may process the new
+  // completion entries in this interrupt, and have nothing to do
+  // in the next interrupt, which is harmless.
+  *R(VIRTIO_MMIO_INTERRUPT_ACK) = *R(VIRTIO_MMIO_INTERRUPT_STATUS) & 0x3;
+
+  __sync_synchronize();
+
+  // the device increments disk.used->idx when it
+  // adds an entry to the used ring.
+
+  while(disk.used_idx != disk.used->idx){
+    __sync_synchronize();
+    int id = disk.used->ring[disk.used_idx % NUM].id;
+
+    if(disk.info[id].status != 0)
+      panic("virtio_disk_intr status");
+
+    struct buf *b = disk.info[id].b;
+    b->disk = 0;   // disk is done with buf
+    wakeup(b);
+
+    disk.used_idx += 1;
+  }
+
+  release(&disk.vdisk_lock);
+}
+#include "param.h"
+#include "types.h"
+#include "memlayout.h"
+#include "elf.h"
+#include "riscv.h"
+#include "defs.h"
+#include "fs.h"
+
+/*
+ * the kernel's page table.
+ */
+pagetable_t kernel_pagetable;
+
+extern char etext[];  // kernel.ld sets this to end of kernel code.
+
+extern char trampoline[]; // trampoline.S
+
+// Make a direct-map page table for the kernel.
+pagetable_t
+kvmmake(void)
+{
+  pagetable_t kpgtbl;
+
+  kpgtbl = (pagetable_t) kalloc();
+  memset(kpgtbl, 0, PGSIZE);
+
+  // uart registers
+  kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  // virtio mmio disk interface
+  kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+  // PLIC
+  kvmmap(kpgtbl, PLIC, PLIC, 0x4000000, PTE_R | PTE_W);
+
+  // map kernel text executable and read-only.
+  kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+
+  // map kernel data and the physical RAM we'll make use of.
+  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  // allocate and map a kernel stack for each process.
+  proc_mapstacks(kpgtbl);
+  
+  return kpgtbl;
+}
+
+// Initialize the one kernel_pagetable
+void
+kvminit(void)
+{
+  kernel_pagetable = kvmmake();
+}
+
+// Switch h/w page table register to the kernel's page table,
+// and enable paging.
+void
+kvminithart()
+{
+  // wait for any previous writes to the page table memory to finish.
+  sfence_vma();
+
+  w_satp(MAKE_SATP(kernel_pagetable));
+
+  // flush stale entries from the TLB.
+  sfence_vma();
+}
+
+// Return the address of the PTE in page table pagetable
+// that corresponds to virtual address va.  If alloc!=0,
+// create any required page-table pages.
+//
+// The risc-v Sv39 scheme has three levels of page-table
+// pages. A page-table page contains 512 64-bit PTEs.
+// A 64-bit virtual address is split into five fields:
+//   39..63 -- must be zero.
+//   30..38 -- 9 bits of level-2 index.
+//   21..29 -- 9 bits of level-1 index.
+//   12..20 -- 9 bits of level-0 index.
+//    0..11 -- 12 bits of byte offset within the page.
+pte_t *
+walk(pagetable_t pagetable, uint64 va, int alloc)
+{
+  if(va >= MAXVA)
+    panic("walk");
+
+  for(int level = 2; level > 0; level--) {
+    pte_t *pte = &pagetable[PX(level, va)];
+    if(*pte & PTE_V) {
+      pagetable = (pagetable_t)PTE2PA(*pte);
+    } else {
+      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+        return 0;
+      memset(pagetable, 0, PGSIZE);
+      *pte = PA2PTE(pagetable) | PTE_V;
+    }
+  }
+  return &pagetable[PX(0, va)];
+}
+
+// Look up a virtual address, return the physical address,
+// or 0 if not mapped.
+// Can only be used to look up user pages.
+uint64
+walkaddr(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa;
+
+  if(va >= MAXVA)
+    return 0;
+
+  pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return 0;
+  if((*pte & PTE_V) == 0)
+    return 0;
+  if((*pte & PTE_U) == 0)
+    return 0;
+  pa = PTE2PA(*pte);
+  return pa;
+}
+
+// add a mapping to the kernel page table.
+// only used when booting.
+// does not flush TLB or enable paging.
+void
+kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  if(mappages(kpgtbl, va, sz, pa, perm) != 0)
+    panic("kvmmap");
+}
+
+// Create PTEs for virtual addresses starting at va that refer to
+// physical addresses starting at pa.
+// va and size MUST be page-aligned.
+// Returns 0 on success, -1 if walk() couldn't
+// allocate a needed page-table page.
+int
+mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+  uint64 a, last;
+  pte_t *pte;
+
+  if((va % PGSIZE) != 0)
+    panic("mappages: va not aligned");
+
+  if((size % PGSIZE) != 0)
+    panic("mappages: size not aligned");
+
+  if(size == 0)
+    panic("mappages: size");
+  
+  a = va;
+  last = va + size - PGSIZE;
+  for(;;){
+    if((pte = walk(pagetable, a, 1)) == 0)
+      return -1;
+    if(*pte & PTE_V)
+      panic("mappages: remap");
+    *pte = PA2PTE(pa) | perm | PTE_V;
+    if(a == last)
+      break;
+    a += PGSIZE;
+    pa += PGSIZE;
+  }
+  return 0;
+}
+
+// Remove npages of mappings starting from va. va must be
+// page-aligned. The mappings must exist.
+// Optionally free the physical memory.
+void
+uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+{
+  uint64 a;
+  pte_t *pte;
+
+  if((va % PGSIZE) != 0)
+    panic("uvmunmap: not aligned");
+
+  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+    if((pte = walk(pagetable, a, 0)) == 0)
+      panic("uvmunmap: walk");
+    if((*pte & PTE_V) == 0)
+      panic("uvmunmap: not mapped");
+    if(PTE_FLAGS(*pte) == PTE_V)
+      panic("uvmunmap: not a leaf");
+    if(do_free){
+      uint64 pa = PTE2PA(*pte);
+      kfree((void*)pa);
+    }
+    *pte = 0;
+  }
+}
+
+// create an empty user page table.
+// returns 0 if out of memory.
+pagetable_t
+uvmcreate()
+{
+  pagetable_t pagetable;
+  pagetable = (pagetable_t) kalloc();
+  if(pagetable == 0)
+    return 0;
+  memset(pagetable, 0, PGSIZE);
+  return pagetable;
+}
+
+// Load the user initcode into address 0 of pagetable,
+// for the very first process.
+// sz must be less than a page.
+void
+uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
+{
+  char *mem;
+
+  if(sz >= PGSIZE)
+    panic("uvmfirst: more than a page");
+  mem = kalloc();
+  memset(mem, 0, PGSIZE);
+  mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U);
+  memmove(mem, src, sz);
+}
+
+// Allocate PTEs and physical memory to grow process from oldsz to
+// newsz, which need not be page aligned.  Returns new size or 0 on error.
+uint64
+uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+{
+  char *mem;
+  uint64 a;
+
+  if(newsz < oldsz)
+    return oldsz;
+
+  oldsz = PGROUNDUP(oldsz);
+  for(a = oldsz; a < newsz; a += PGSIZE){
+    mem = kalloc();
+    if(mem == 0){
+      uvmdealloc(pagetable, a, oldsz);
+      return 0;
+    }
+    memset(mem, 0, PGSIZE);
+    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
+      kfree(mem);
+      uvmdealloc(pagetable, a, oldsz);
+      return 0;
+    }
+  }
+  return newsz;
+}
+
+// Deallocate user pages to bring the process size from oldsz to
+// newsz.  oldsz and newsz need not be page-aligned, nor does newsz
+// need to be less than oldsz.  oldsz can be larger than the actual
+// process size.  Returns the new process size.
+uint64
+uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+{
+  if(newsz >= oldsz)
+    return oldsz;
+
+  if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
+    int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+  }
+
+  return newsz;
+}
+
+// Recursively free page-table pages.
+// All leaf mappings must already have been removed.
+void
+freewalk(pagetable_t pagetable)
+{
+  // there are 2^9 = 512 PTEs in a page table.
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      freewalk((pagetable_t)child);
+      pagetable[i] = 0;
+    } else if(pte & PTE_V){
+      panic("freewalk: leaf");
+    }
+  }
+  kfree((void*)pagetable);
+}
+
+// Free user memory pages,
+// then free page-table pages.
+void
+uvmfree(pagetable_t pagetable, uint64 sz)
+{
+  if(sz > 0)
+    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
+  freewalk(pagetable);
+}
+
+// Given a parent process's page table, copy
+// its memory into a child's page table.
+// Copies both the page table and the
+// physical memory.
+// returns 0 on success, -1 on failure.
+// frees any allocated pages on failure.
+int
+uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+  char *mem;
+
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walk(old, i, 0)) == 0)
+      panic("uvmcopy: pte should exist");
+    if((*pte & PTE_V) == 0)
+      panic("uvmcopy: page not present");
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    if((mem = kalloc()) == 0)
+      goto err;
+    memmove(mem, (char*)pa, PGSIZE);
+    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+      kfree(mem);
+      goto err;
+    }
+  }
+  return 0;
+
+ err:
+  uvmunmap(new, 0, i / PGSIZE, 1);
+  return -1;
+}
+
+// mark a PTE invalid for user access.
+// used by exec for the user stack guard page.
+void
+uvmclear(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  
+  pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    panic("uvmclear");
+  *pte &= ~PTE_U;
+}
+
+// Copy from kernel to user.
+// Copy len bytes from src to virtual address dstva in a given page table.
+// Return 0 on success, -1 on error.
+int
+copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+{
+  uint64 n, va0, pa0;
+  pte_t *pte;
+
+  while(len > 0){
+    va0 = PGROUNDDOWN(dstva);
+    if(va0 >= MAXVA)
+      return -1;
+    pte = walk(pagetable, va0, 0);
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
+       (*pte & PTE_W) == 0)
+      return -1;
+    pa0 = PTE2PA(*pte);
+    n = PGSIZE - (dstva - va0);
+    if(n > len)
+      n = len;
+    memmove((void *)(pa0 + (dstva - va0)), src, n);
+
+    len -= n;
+    src += n;
+    dstva = va0 + PGSIZE;
+  }
+  return 0;
+}
+
+// Copy from user to kernel.
+// Copy len bytes to dst from virtual address srcva in a given page table.
+// Return 0 on success, -1 on error.
+int
+copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+{
+  uint64 n, va0, pa0;
+
+  while(len > 0){
+    va0 = PGROUNDDOWN(srcva);
+    pa0 = walkaddr(pagetable, va0);
+    if(pa0 == 0)
+      return -1;
+    n = PGSIZE - (srcva - va0);
+    if(n > len)
+      n = len;
+    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+
+    len -= n;
+    dst += n;
+    srcva = va0 + PGSIZE;
+  }
+  return 0;
+}
+
+// Copy a null-terminated string from user to kernel.
+// Copy bytes to dst from virtual address srcva in a given page table,
+// until a '\0', or max.
+// Return 0 on success, -1 on error.
+int
+copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+{
+  uint64 n, va0, pa0;
+  int got_null = 0;
+
+  while(got_null == 0 && max > 0){
+    va0 = PGROUNDDOWN(srcva);
+    pa0 = walkaddr(pagetable, va0);
+    if(pa0 == 0)
+      return -1;
+    n = PGSIZE - (srcva - va0);
+    if(n > max)
+      n = max;
+
+    char *p = (char *) (pa0 + (srcva - va0));
+    while(n > 0){
+      if(*p == '\0'){
+        *dst = '\0';
+        got_null = 1;
+        break;
+      } else {
+        *dst = *p;
+      }
+      --n;
+      --max;
+      p++;
+      dst++;
+    }
+
+    srcva = va0 + PGSIZE;
+  }
+  if(got_null){
+    return 0;
+  } else {
+    return -1;
+  }
 }
