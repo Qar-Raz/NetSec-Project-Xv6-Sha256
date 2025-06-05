@@ -510,7 +510,7 @@ loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset, uint sz
   return 0;
 }
 //
-// Support functions for system calls that involve file descriptors.
+// Support functions for system calls that involve file descriptors fadf.
 //
 
 #include "types.h"

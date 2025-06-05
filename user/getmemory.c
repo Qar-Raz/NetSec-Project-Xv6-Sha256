@@ -42,15 +42,15 @@ int main() {
   }
 
   // Print what was read from the file
-  printf("Read from sample.txt: %s\n", filehash);
+  printf("Read from Previous Hash: %s\n", filehash);
 
   // Compare hashes
   if (strcmp(hash, filehash) == 0) {
-    printf("Hash MATCHES with sample.txt!\n");
+    printf("Hash MATCHES with Previous Hash! Check Sucessful.\n");
   } else {
-    printf("Hash DOES NOT match sample.txt.\n");
-    printf("From kernel:    %s\n", hash);
-    printf("From file:      %s\n", filehash);
+    printf("Hash DOES NOT match with Previous Hash. KERNEL INTEGRIDY COMPROMISED !!.\n");
+    printf("Current kernel hash:    %s\n", hash);
+    printf("Previous Hash:      %s\n", filehash);
   }
 
   exit(0);

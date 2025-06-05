@@ -1,5 +1,5 @@
 //
-// Support functions for system calls that involve file descriptors.
+// Support functions for system calls that involve file descriptors fadf.
 //
 
 #include "types.h"
